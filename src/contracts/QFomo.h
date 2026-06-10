@@ -1,15 +1,100 @@
-using namespace QPI;
 #include "qpi.h"
+
+using namespace QPI;
+
+constexpr sint64 QFOMO_INITIAL_BID_PRICE = 1000000;
+
+constexpr uint32 QFOMO_BPS = 10000;
+
+constexpr uint32 QFOMO_ALPHA_BPS = 5000; // 50% for dividends
+constexpr uint32 QFOMO_TEAM_BPS = 1000; // 10% for Team/Shareholders/Burn
+constexpr uint32 QFOMO_JACKPOT_BPS = 4000; // 40% for jackpot
+
+constexpr uint32 QFOMO_GROWTH_BPS = 1000; // 10% growth per bid
+constexpr uint32 QFOMO_RECENT_WEIGHT_BPS = 2000; // 20% of dividend pool to recent group
+
+constexpr uint32 QFOMO_X = 500; // total future bids that pay one bid
+constexpr uint32 QFOMO_W = 400; // old group size
+constexpr uint32 QFOMO_RECENT_LEN = QFOMO_X - QFOMO_W; // 100 recent bids
+constexpr uint32 QFOMO_OLD_LEN = QFOMO_W; // 400 olds bids
+
+constexpr uint32 QFOMO_DEFAULT_MAX_TIMER_TICKS = 108000; //24h = 24 * 3600 / 0.8 (~0.8s per tick)
+constexpr uint32 QFOMO_DEFAULT_ADD_TIMER_TICKS = 38; // 30s = 30 / 0.8 (~0.8s per tick)
+
+constexpr uint32 QFOMO_STATUS_ACTIVE = 1;
+constexpr uint32 QFOMO_STATUS_FINALIZED = 2;
+
+constexpr uint32 QFOMO_SUCCESS = 0;
+
 
 struct QFOMO : public ContractBase
 {
+
+    struct Round
+    {
+        uint32 roundId;
+
+        uint64 startTick;
+        uint64 endTick;
+        uint64 finalizedTick;
+
+        uint32 currentBidCount;
+
+        sint64 currentBidPrice;
+
+        sint64 jackpot;
+
+        id lastBidder;
+        uint32 lastBidNumber;
+
+        uint32 status;
+    };
+
     struct StateData
     {
-        // empty for now
+        Round round;
+
+        uint32 totalRounds;
+        uint32 totalBids;
+    };
+
+    struct GetGame_input
+    {
+    };
+
+    struct GetGame_output
+    {
+        uint32 returnCode;
+        uint32 roundId;
+        uint64 startTick;
+        uint64 endTick;
+        uint64 finalizedTick;
+        uint64 currentTick;
+        uint32 remainingTick;
+        uint32 currentBidCount;
+        sint64 currentBidPrice;
+        sint64 jackpot;
+        id lastBidder;
+        uint32 lastBidNumber;
+        uint32 status;
+        uint32 totalRounds;
+        uint32 totalBids;
     };
 
     INITIALIZE()
     {
+        state.mut().round.roundId = 1;
+        state.mut().round.startTick = qpi.tick();
+        state.mut().round.endTick = state.get().round.startTick + QFOMO_DEFAULT_MAX_TIMER_TICKS;
+        state.mut().round.finalizedTick = 0;
+        state.mut().round.currentBidCount = 0;
+        state.mut().round.currentBidPrice = QFOMO_INITIAL_BID_PRICE;
+        state.mut().round.jackpot = 0;
+        state.mut().round.lastBidder = NULL_ID;
+        state.mut().round.lastBidNumber = 0;
+        state.mut().round.status = QFOMO_STATUS_ACTIVE;
+        state.mut().totalRounds = 1;
+        state.mut().totalBids = 0;
     }
 
     PUBLIC_PROCEDURE(PlaceBid)
@@ -22,6 +107,21 @@ struct QFOMO : public ContractBase
 
     PUBLIC_FUNCTION(GetGame)
     {
+        output.returnCode = QFOMO_SUCCESS;
+        output.roundId = state.get().round.roundId;
+        output.startTick = state.get().round.startTick;
+        output.endTick = state.get().round.endTick;
+        output.finalizedTick = state.get().round.finalizedTick;
+        output.currentTick = qpi.tick();
+        output.remainingTick = state.get().round.endTick > qpi.tick() ? state.get().round.endTick - qpi.tick() : 0;
+        output.currentBidCount = state.get().round.currentBidCount;
+        output.currentBidPrice = state.get().round.currentBidPrice;
+        output.jackpot = state.get().round.jackpot;
+        output.lastBidder = state.get().round.lastBidder;
+        output.lastBidNumber = state.get().round.lastBidNumber;
+        output.status = state.get().round.status;
+        output.totalRounds = state.get().totalRounds;
+        output.totalBids = state.get().totalBids;
     }
 
     END_TICK()
