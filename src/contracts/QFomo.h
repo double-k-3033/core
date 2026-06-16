@@ -25,6 +25,8 @@ constexpr uint32 QFOMO_STATUS_ACTIVE = 1;
 constexpr uint32 QFOMO_STATUS_FINALIZED = 2;
 
 constexpr uint32 QFOMO_SUCCESS = 0;
+constexpr uint32 QFOMO_ERR_INVALID_PAYMENT = 1;
+constexpr uint32 QFOMO_ERR_ROUND_NOT_ACTIVE = 2;
 
 
 struct QFOMO : public ContractBase
@@ -70,7 +72,7 @@ struct QFOMO : public ContractBase
         uint64 endTick;
         uint64 finalizedTick;
         uint64 currentTick;
-        uint32 remainingTick;
+        uint64 remainingTick;
         uint32 currentBidCount;
         sint64 currentBidPrice;
         sint64 jackpot;
@@ -79,6 +81,23 @@ struct QFOMO : public ContractBase
         uint32 status;
         uint32 totalRounds;
         uint32 totalBids;
+    };
+
+    struct PlaceBid_input
+    {
+    };
+
+    struct PlaceBid_output
+    {
+        uint32 returnCode;
+    };
+
+    struct Claim_input
+    {
+    };
+    
+    struct Claim_output
+    {
     };
 
     INITIALIZE()
@@ -99,6 +118,39 @@ struct QFOMO : public ContractBase
 
     PUBLIC_PROCEDURE(PlaceBid)
     {
+        
+        if (state.get().round.status != QFOMO_STATUS_ACTIVE || qpi.tick() >= state.get().round.endTick)
+        {
+            qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            output.returnCode = QFOMO_ERR_ROUND_NOT_ACTIVE;
+            return;
+        }
+        
+        if (qpi.invocationReward() < state.get().round.currentBidPrice)
+        {
+            if (qpi.invocationReward() > 0)
+            {
+                qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            }
+            output.returnCode = QFOMO_ERR_INVALID_PAYMENT;
+            return;
+        }
+
+        if (qpi.invocationReward() > state.get().round.currentBidPrice)
+        {
+            qpi.transfer(qpi.invocator(), qpi.invocationReward() - state.get().round.currentBidPrice);
+        }
+        
+        state.mut().round.currentBidCount ++;
+        state.mut().totalBids ++;
+
+        state.mut().round.lastBidder = qpi.invocator();
+        state.mut().round.lastBidNumber = state.get().round.currentBidCount;
+
+        state.mut().round.currentBidPrice = state.get().round.currentBidPrice + (div<sint64>(state.get().round.currentBidPrice * QFOMO_GROWTH_BPS, QFOMO_BPS));
+        state.mut().round.endTick = state.get().round.endTick + QFOMO_DEFAULT_ADD_TIMER_TICKS - qpi.tick() > QFOMO_DEFAULT_MAX_TIMER_TICKS ? qpi.tick() + QFOMO_DEFAULT_MAX_TIMER_TICKS : state.get().round.endTick + QFOMO_DEFAULT_ADD_TIMER_TICKS;
+
+        output.returnCode = QFOMO_SUCCESS;
     }
 
     PUBLIC_PROCEDURE(Claim)
