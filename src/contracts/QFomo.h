@@ -12,7 +12,7 @@ constexpr uint32 QFOMO_TEAM_BPS = 1000; // 10% for Team/Shareholders/Burn
 constexpr uint32 QFOMO_JACKPOT_BPS = 4000; // 40% for jackpot
 
 constexpr uint32 QFOMO_GROWTH_BPS = 1000; // 10% growth per bid
-constexpr uint32 QFOMO_RECENT_WEIGHT_BPS = 2000; // 20% of dividend pool to recent group
+constexpr uint32 QFOMO_RECENT_WEIGHT_BPS = 4000; // 40% of dividend pool to recent group
 
 constexpr uint32 QFOMO_X = 200; // total future bids that pay one bid
 constexpr uint32 QFOMO_W = 160; // old group size
@@ -26,6 +26,11 @@ constexpr uint32 QFOMO_DEFAULT_ADD_TIMER_TICKS = 38; // 30s = 30 / 0.8 (~0.8s pe
 
 constexpr uint32 QFOMO_STATUS_ACTIVE = 1;
 constexpr uint32 QFOMO_STATUS_FINALIZED = 2;
+
+constexpr uint32 QFOMO_BID_PHASE_EMPTY = 0;
+constexpr uint32 QFOMO_BID_PHASE_RECENT = 1;
+constexpr uint32 QFOMO_BID_PHASE_OLD = 2;
+constexpr uint32 QFOMO_BID_PHASE_EXPIRED = 3;
 
 constexpr uint32 QFOMO_SUCCESS = 0;
 constexpr uint32 QFOMO_ERR_INVALID_PAYMENT = 1;
@@ -49,9 +54,12 @@ struct QFOMO : public ContractBase
         sint64 currentBidPrice;
 
         sint64 jackpot;
-        sint64 dividendReserve; //  Total dividend money allocated but not yet assigned to users
+        sint64 dividendReserve; // Total outstanding dividend liabilities assigned to real bids
         sint64 teamReserve; // Team/shareholder/burn allocation
         sint64 totalVolume; // Total accepted bid payments in the current round
+
+        sint64 recentDividendAccumulator;
+        sint64 oldDividendAccumulator;
 
         id lastBidder;
         uint32 lastBidNumber;
@@ -59,9 +67,27 @@ struct QFOMO : public ContractBase
         uint32 status;
     };
 
+    struct ActiveBid
+    {
+        uint32 roundId;
+        uint32 bidNumber;
+
+        id bidder;
+
+        sint64 recentAccumulatorDebt;
+        sint64 oldAccumulatorDebt;
+
+        sint64 settledRecentDividend;
+        sint64 settledDividend;
+
+        uint32 phase;
+    };
+
     struct StateData
     {
         Round round;
+
+        Array<ActiveBid, QFOMO_ACTIVE_BID_CAPACITY> activeBids;
 
         uint32 totalRounds;
         uint32 totalBids;
@@ -134,6 +160,8 @@ struct QFOMO : public ContractBase
         state.mut().round.teamReserve = 0;
         state.mut().round.jackpot = 0;
         state.mut().round.totalVolume = 0;
+        state.mut().round.recentDividendAccumulator = 0;
+        state.mut().round.oldDividendAccumulator = 0;
         state.mut().round.lastBidder = NULL_ID;
         state.mut().round.lastBidNumber = 0;
         state.mut().round.status = QFOMO_STATUS_ACTIVE;
@@ -149,6 +177,34 @@ struct QFOMO : public ContractBase
         sint64 dividendAmount;
         sint64 teamAmount;
         sint64 jackpotAmount;
+
+        sint64 recentPool;
+        sint64 oldPool;
+
+        sint64 recentPerSlot;
+        sint64 oldPerSlot;
+
+        sint64 assignedRecentAmount;
+        sint64 assignedOldAmount;
+        sint64 assignedDividendAmount;
+        sint64 phantomDividendAmount;
+
+        sint64 recentEarned;
+        sint64 oldEarned;
+
+        uint32 priorBidCount;
+        uint32 recentRealCount;
+        uint32 oldRealCount;
+
+        uint32 newBidNumber;
+        uint32 slotIndex;
+        uint32 transitionBidNumber;
+        uint32 transitionSlotIndex;
+        uint32 expiredBidNumber;
+        uint32 expiredSlotIndex;
+
+        ActiveBid activeBid;
+        ActiveBid newBid;
     };
 
     PUBLIC_PROCEDURE_WITH_LOCALS(PlaceBid)
@@ -157,7 +213,10 @@ struct QFOMO : public ContractBase
 
         if (state.get().round.status != QFOMO_STATUS_ACTIVE || qpi.tick() >= state.get().round.endTick)
         {
-            qpi.transfer(qpi.invocator(), locals.invocationReward);
+            if(locals.invocationReward > 0)
+            {
+                qpi.transfer(qpi.invocator(), locals.invocationReward);
+            }
             output.returnCode = QFOMO_ERR_ROUND_NOT_ACTIVE;
             return;
         }
@@ -193,19 +252,87 @@ struct QFOMO : public ContractBase
         
         locals.acceptedBidPrice = state.get().round.currentBidPrice;
 
-        state.mut().round.dividendReserve += locals.dividendAmount;
+        locals.recentPool = div<sint64>(locals.dividendAmount * QFOMO_RECENT_WEIGHT_BPS, QFOMO_BPS);
+        locals.oldPool = locals.dividendAmount - locals.recentPool;
+        locals.recentPerSlot = div<sint64>(locals.recentPool, QFOMO_RECENT_LEN);
+        locals.oldPerSlot = div<sint64>(locals.oldPool, QFOMO_OLD_LEN);
+
+        locals.priorBidCount = state.get().round.currentBidCount;
+        locals.recentRealCount = locals.priorBidCount < QFOMO_RECENT_LEN ? locals.priorBidCount : QFOMO_RECENT_LEN;
+        locals.oldRealCount = locals.priorBidCount > QFOMO_RECENT_LEN ? locals.priorBidCount - QFOMO_RECENT_LEN : 0;
+
+        locals.assignedRecentAmount = locals.recentPerSlot * locals.recentRealCount;
+        locals.assignedOldAmount = locals.oldPerSlot * locals.oldRealCount;
+        locals.assignedDividendAmount = locals.assignedRecentAmount + locals.assignedOldAmount;
+        locals.phantomDividendAmount = locals.dividendAmount - locals.assignedDividendAmount;
+        locals.jackpotAmount += locals.phantomDividendAmount;
+
+        state.mut().round.dividendReserve += locals.assignedDividendAmount;
         state.mut().round.teamReserve += locals.teamAmount;
         state.mut().round.jackpot += locals.jackpotAmount;
-        state.mut().round.totalVolume += state.get().round.currentBidPrice;
-        
-        state.mut().round.currentBidCount ++;
+        state.mut().round.totalVolume += locals.acceptedBidPrice;
+
+        state.mut().round.recentDividendAccumulator += locals.recentPerSlot;
+        state.mut().round.oldDividendAccumulator += locals.oldPerSlot;
+
+        locals.newBidNumber = state.get().round.currentBidCount + 1;
+        if (locals.newBidNumber > QFOMO_RECENT_LEN)
+        {
+            locals.transitionBidNumber = locals.newBidNumber - QFOMO_RECENT_LEN;
+            locals.transitionSlotIndex = locals.transitionBidNumber - 1;
+            locals.activeBid = state.get().activeBids.get(locals.transitionSlotIndex);
+
+            if (locals.activeBid.roundId == state.get().round.roundId && locals.activeBid.bidNumber == locals.transitionBidNumber && locals.activeBid.phase == QFOMO_BID_PHASE_RECENT)
+            {
+                locals.recentEarned = state.get().round.recentDividendAccumulator - locals.activeBid.recentAccumulatorDebt;
+                locals.activeBid.settledRecentDividend += locals.recentEarned;
+                locals.activeBid.oldAccumulatorDebt = state.get().round.oldDividendAccumulator;
+                locals.activeBid.phase = QFOMO_BID_PHASE_OLD;
+                state.mut().activeBids.set(locals.transitionSlotIndex, locals.activeBid);
+            }
+        }
+
+        if (locals.newBidNumber > QFOMO_X)
+        {
+            locals.expiredBidNumber = locals.newBidNumber - QFOMO_X;
+            locals.expiredSlotIndex = locals.expiredBidNumber - 1;
+            locals.activeBid = state.get().activeBids.get(locals.expiredSlotIndex);
+
+            if (locals.activeBid.roundId == state.get().round.roundId && locals.activeBid.bidNumber == locals.expiredBidNumber && locals.activeBid.phase == QFOMO_BID_PHASE_OLD)
+            {
+                locals.oldEarned = state.get().round.oldDividendAccumulator - locals.activeBid.oldAccumulatorDebt;
+                locals.activeBid.settledDividend = locals.activeBid.settledRecentDividend + locals.oldEarned;
+                locals.activeBid.phase = QFOMO_BID_PHASE_EXPIRED;
+                state.mut().activeBids.set(locals.expiredSlotIndex, locals.activeBid);
+            }
+        }
+
+        locals.slotIndex = locals.newBidNumber - 1;
+        locals.newBid.roundId = state.get().round.roundId;
+        locals.newBid.bidNumber = locals.newBidNumber;
+        locals.newBid.bidder = qpi.invocator();
+        locals.newBid.recentAccumulatorDebt = state.get().round.recentDividendAccumulator;
+        locals.newBid.oldAccumulatorDebt = 0;
+        locals.newBid.settledRecentDividend = 0;
+        locals.newBid.settledDividend = 0;
+        locals.newBid.phase = QFOMO_BID_PHASE_RECENT;
+        state.mut().activeBids.set(locals.slotIndex, locals.newBid);
+
+        state.mut().round.currentBidCount = locals.newBidNumber;
         state.mut().totalBids ++;
-
         state.mut().round.lastBidder = qpi.invocator();
-        state.mut().round.lastBidNumber = state.get().round.currentBidCount;
+        state.mut().round.lastBidNumber = locals.newBidNumber;
 
-        state.mut().round.currentBidPrice = locals.acceptedBidPrice + (div<sint64>(locals.acceptedBidPrice * QFOMO_GROWTH_BPS, QFOMO_BPS));
-        state.mut().round.endTick = state.get().round.endTick + QFOMO_DEFAULT_ADD_TIMER_TICKS - qpi.tick() > QFOMO_DEFAULT_MAX_TIMER_TICKS ? qpi.tick() + QFOMO_DEFAULT_MAX_TIMER_TICKS : state.get().round.endTick + QFOMO_DEFAULT_ADD_TIMER_TICKS;
+        if (locals.newBidNumber == QFOMO_MAX_BIDS_PER_ROUND)
+        {
+            state.mut().round.currentBidPrice = 0;
+            state.mut().round.endTick = qpi.tick();
+        }
+        else
+        {
+            state.mut().round.currentBidPrice = locals.acceptedBidPrice + (div<sint64>(locals.acceptedBidPrice * QFOMO_GROWTH_BPS, QFOMO_BPS));
+            state.mut().round.endTick = state.get().round.endTick + QFOMO_DEFAULT_ADD_TIMER_TICKS - qpi.tick() > QFOMO_DEFAULT_MAX_TIMER_TICKS ? qpi.tick() + QFOMO_DEFAULT_MAX_TIMER_TICKS : state.get().round.endTick + QFOMO_DEFAULT_ADD_TIMER_TICKS;
+        }
 
         output.returnCode = QFOMO_SUCCESS;
         output.bidNumber = state.get().round.currentBidCount;
