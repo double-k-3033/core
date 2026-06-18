@@ -4,6 +4,7 @@ using namespace QPI;
 
 constexpr sint64 QFOMO_INITIAL_BID_PRICE = 1000000;
 constexpr uint32 QFOMO_ACTIVE_BID_CAPACITY = 256;
+constexpr uint32 QFOMO_PLAYER_CAPACITY = 4096;
 
 constexpr uint32 QFOMO_BPS = 10000;
 
@@ -36,6 +37,7 @@ constexpr uint32 QFOMO_SUCCESS = 0;
 constexpr uint32 QFOMO_ERR_INVALID_PAYMENT = 1;
 constexpr uint32 QFOMO_ERR_ROUND_NOT_ACTIVE = 2;
 constexpr uint32 QFOMO_ERR_BIDS_REACHED = 3;
+constexpr uint32 QFOMO_ERR_PLAYER_CAPACITY = 4;
 
 
 struct QFOMO : public ContractBase
@@ -83,11 +85,19 @@ struct QFOMO : public ContractBase
         uint32 phase;
     };
 
+    struct PlayerAccount
+    {
+        sint64 pendingDividend;
+        sint64 totalClaimed;
+    };
+
     struct StateData
     {
         Round round;
 
         Array<ActiveBid, QFOMO_ACTIVE_BID_CAPACITY> activeBids;
+
+        HashMap<id, PlayerAccount, QFOMO_PLAYER_CAPACITY> playerAccounts;
 
         uint32 totalRounds;
         uint32 totalBids;
@@ -117,6 +127,18 @@ struct QFOMO : public ContractBase
         uint32 status;
         uint32 totalRounds;
         uint32 totalBids;
+    };
+
+    struct GetPlayer_input
+    {
+        id player;
+    };
+
+    struct GetPlayer_output
+    {
+        sint64 pendingDividend;
+        sint64 totalClaimed;
+        uint32 exists;
     };
 
     struct PlaceBid_input
@@ -205,6 +227,9 @@ struct QFOMO : public ContractBase
 
         ActiveBid activeBid;
         ActiveBid newBid;
+
+        PlayerAccount playerAccount;
+        sint64 playerAccountIndex;
     };
 
     PUBLIC_PROCEDURE_WITH_LOCALS(PlaceBid)
@@ -239,6 +264,22 @@ struct QFOMO : public ContractBase
             }
             output.returnCode = QFOMO_ERR_INVALID_PAYMENT;
             return;
+        }
+
+        if (!state.get().playerAccounts.get(qpi.invocator(), locals.playerAccount))
+        {
+            locals.playerAccount.pendingDividend = 0;
+            locals.playerAccount.totalClaimed = 0;
+            locals.playerAccountIndex = state.mut().playerAccounts.set(qpi.invocator(), locals.playerAccount);
+            if (locals.playerAccountIndex == NULL_INDEX)
+            {
+                if (locals.invocationReward > 0)
+                {
+                    qpi.transfer(qpi.invocator(), locals.invocationReward);
+                }
+                output.returnCode = QFOMO_ERR_PLAYER_CAPACITY;
+                return;
+            }
         }
 
         if (locals.invocationReward > state.get().round.currentBidPrice)
@@ -302,8 +343,13 @@ struct QFOMO : public ContractBase
             {
                 locals.oldEarned = state.get().round.oldDividendAccumulator - locals.activeBid.oldAccumulatorDebt;
                 locals.activeBid.settledDividend = locals.activeBid.settledRecentDividend + locals.oldEarned;
-                locals.activeBid.phase = QFOMO_BID_PHASE_EXPIRED;
-                state.mut().activeBids.set(locals.expiredSlotIndex, locals.activeBid);
+                if (state.get().playerAccounts.get(locals.activeBid.bidder, locals.playerAccount))
+                {
+                    locals.playerAccount.pendingDividend += locals.activeBid.settledDividend;
+                    state.mut().playerAccounts.set(locals.activeBid.bidder, locals.playerAccount);
+                    locals.activeBid.phase = QFOMO_BID_PHASE_EXPIRED;
+                    state.mut().activeBids.set(locals.expiredSlotIndex, locals.activeBid);
+                }
             }
         }
 
@@ -371,6 +417,27 @@ struct QFOMO : public ContractBase
         output.totalBids = state.get().totalBids;
     }
 
+    struct GetPlayer_locals
+    {
+        PlayerAccount playerAccount;
+    };
+
+    PUBLIC_FUNCTION_WITH_LOCALS(GetPlayer)
+    {
+        if (state.get().playerAccounts.get(input.player, locals.playerAccount))
+        {
+            output.pendingDividend = locals.playerAccount.pendingDividend;
+            output.totalClaimed = locals.playerAccount.totalClaimed;
+            output.exists = 1;
+        }
+        else
+        {
+            output.pendingDividend = 0;
+            output.totalClaimed = 0;
+            output.exists = 0;
+        }
+    }
+
     END_TICK()
     {
     }
@@ -381,5 +448,6 @@ struct QFOMO : public ContractBase
         REGISTER_USER_PROCEDURE(Claim, 2);
 
         REGISTER_USER_FUNCTION(GetGame, 1);
+        REGISTER_USER_FUNCTION(GetPlayer, 2);
     }
 };
