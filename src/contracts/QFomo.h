@@ -56,8 +56,6 @@ struct QFOMO : public ContractBase
         sint64 currentBidPrice;
 
         sint64 jackpot;
-        sint64 dividendReserve; // Total outstanding dividend liabilities assigned to real bids
-        sint64 teamReserve; // Team/shareholder/burn allocation
         sint64 totalVolume; // Total accepted bid payments in the current round
 
         sint64 recentDividendAccumulator;
@@ -98,6 +96,9 @@ struct QFOMO : public ContractBase
         Array<ActiveBid, QFOMO_ACTIVE_BID_CAPACITY> activeBids;
 
         HashMap<id, PlayerAccount, QFOMO_PLAYER_CAPACITY> playerAccounts;
+
+        sint64 dividendReserve;
+        sint64 teamReserve;
 
         uint32 totalRounds;
         uint32 totalBids;
@@ -178,8 +179,8 @@ struct QFOMO : public ContractBase
         state.mut().round.finalizedTick = 0;
         state.mut().round.currentBidCount = 0;
         state.mut().round.currentBidPrice = QFOMO_INITIAL_BID_PRICE;
-        state.mut().round.dividendReserve = 0;
-        state.mut().round.teamReserve = 0;
+        state.mut().dividendReserve = 0;
+        state.mut().teamReserve = 0;
         state.mut().round.jackpot = 0;
         state.mut().round.totalVolume = 0;
         state.mut().round.recentDividendAccumulator = 0;
@@ -308,8 +309,8 @@ struct QFOMO : public ContractBase
         locals.phantomDividendAmount = locals.dividendAmount - locals.assignedDividendAmount;
         locals.jackpotAmount += locals.phantomDividendAmount;
 
-        state.mut().round.dividendReserve += locals.assignedDividendAmount;
-        state.mut().round.teamReserve += locals.teamAmount;
+        state.mut().dividendReserve += locals.assignedDividendAmount;
+        state.mut().teamReserve += locals.teamAmount;
         state.mut().round.jackpot += locals.jackpotAmount;
         state.mut().round.totalVolume += locals.acceptedBidPrice;
 
@@ -406,8 +407,8 @@ struct QFOMO : public ContractBase
         output.remainingTick = state.get().round.endTick > qpi.tick() ? state.get().round.endTick - qpi.tick() : 0;
         output.currentBidCount = state.get().round.currentBidCount;
         output.currentBidPrice = state.get().round.currentBidPrice;
-        output.dividendReserve = state.get().round.dividendReserve;
-        output.teamReserve = state.get().round.teamReserve;
+        output.dividendReserve = state.get().dividendReserve;
+        output.teamReserve = state.get().teamReserve;
         output.jackpot = state.get().round.jackpot;
         output.totalVolume = state.get().round.totalVolume;
         output.lastBidder = state.get().round.lastBidder;
@@ -438,8 +439,88 @@ struct QFOMO : public ContractBase
         }
     }
 
-    END_TICK()
+    struct END_TICK_locals
     {
+        uint32 bidIndex;
+
+        ActiveBid activeBid;
+        PlayerAccount playerAccount;
+
+        sint64 recentEarned;
+        sint64 oldEarned;
+        sint64 settledDividend;
+
+        sint64 transferResult;
+    };
+
+    END_TICK_WITH_LOCALS()
+    {
+        if (state.get().round.status != QFOMO_STATUS_ACTIVE || qpi.tick() < state.get().round.endTick)
+        {
+            return;
+        }
+
+        for (locals.bidIndex = 0; locals.bidIndex < state.get().round.currentBidCount; locals.bidIndex++)
+        {
+            locals.activeBid = state.get().activeBids.get(locals.bidIndex);
+
+            if (locals.activeBid.roundId != state.get().round.roundId || locals.activeBid.bidNumber != locals.bidIndex + 1)
+            {
+                continue;
+            }
+
+            if (locals.activeBid.phase == QFOMO_BID_PHASE_EXPIRED)
+            {
+                continue;
+            }
+
+            locals.recentEarned = 0;
+            locals.oldEarned = 0;
+            locals.settledDividend = 0;
+
+            if (locals.activeBid.phase == QFOMO_BID_PHASE_RECENT)
+            {
+                locals.recentEarned = state.get().round.recentDividendAccumulator - locals.activeBid.recentAccumulatorDebt;
+                locals.activeBid.settledRecentDividend = locals.recentEarned;
+                locals.settledDividend = locals.recentEarned;
+            }
+            else if (locals.activeBid.phase == QFOMO_BID_PHASE_OLD)
+            {
+                locals.oldEarned = state.get().round.oldDividendAccumulator - locals.activeBid.oldAccumulatorDebt;
+                locals.settledDividend = locals.activeBid.settledRecentDividend + locals.oldEarned;
+            }
+            else
+            {
+                continue;
+            }
+
+            if (!state.get().playerAccounts.get(locals.activeBid.bidder, locals.playerAccount))
+            {
+                return;
+            }
+
+            locals.playerAccount.pendingDividend += locals.settledDividend;
+            state.mut().playerAccounts.set(locals.activeBid.bidder, locals.playerAccount);
+
+            locals.activeBid.settledDividend = locals.settledDividend;
+            locals.activeBid.phase = QFOMO_BID_PHASE_EXPIRED;
+
+            state.mut().activeBids.set(locals.bidIndex, locals.activeBid);
+        }
+        
+        if (state.get().round.currentBidCount > 0 && state.get().round.jackpot > 0)
+        {
+            locals.transferResult = qpi.transfer(state.get().round.lastBidder, state.get().round.jackpot);
+            if (locals.transferResult < 0)
+            {
+                return;
+            }
+            state.mut().round.jackpot = 0;
+        }
+
+        state.mut().round.currentBidPrice = 0;
+        state.mut().round.finalizedTick = qpi.tick();
+        state.mut().round.status = QFOMO_STATUS_FINALIZED;
     }
 
     REGISTER_USER_FUNCTIONS_AND_PROCEDURES()
