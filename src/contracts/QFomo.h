@@ -38,6 +38,12 @@ constexpr uint32 QFOMO_ERR_INVALID_PAYMENT = 1;
 constexpr uint32 QFOMO_ERR_ROUND_NOT_ACTIVE = 2;
 constexpr uint32 QFOMO_ERR_BIDS_REACHED = 3;
 constexpr uint32 QFOMO_ERR_PLAYER_CAPACITY = 4;
+constexpr uint32 QFOMO_ERR_PLAYER_NOT_FOUND = 5;
+constexpr uint32 QFOMO_ERR_NOTHING_TO_CLAIM = 6;
+constexpr uint32 QFOMO_ERR_TRANSFER_FAILED = 7;
+constexpr uint32 QFOMO_ERR_RESERVE_MISMATCH = 8;
+
+
 
 
 struct QFOMO : public ContractBase
@@ -169,6 +175,9 @@ struct QFOMO : public ContractBase
     
     struct Claim_output
     {
+        sint64 claimedAmount;
+        sint64 remainingDividend;
+        uint32 returnCode;
     };
 
     INITIALIZE()
@@ -392,8 +401,67 @@ struct QFOMO : public ContractBase
         output.endTick = state.get().round.endTick;
     }
 
-    PUBLIC_PROCEDURE(Claim)
+    struct Claim_locals
     {
+        PlayerAccount playerAccount;
+        sint64 invocationReward;
+        sint64 claimAmount;
+        sint64 transferResult;
+    };
+
+    PUBLIC_PROCEDURE_WITH_LOCALS(Claim)
+    {
+        locals.invocationReward = qpi.invocationReward();
+
+        if (locals.invocationReward > 0)
+        {
+            qpi.transfer(qpi.invocator(), locals.invocationReward);
+        }
+
+        output.claimedAmount = 0;
+        output.remainingDividend = 0;
+
+        if (!state.get().playerAccounts.get(qpi.invocator(), locals.playerAccount))
+        {
+            output.returnCode = QFOMO_ERR_PLAYER_NOT_FOUND;
+            return;
+        }
+
+        locals.claimAmount = locals.playerAccount.pendingDividend;
+
+        output.remainingDividend = locals.claimAmount;
+
+        if (locals.claimAmount <= 0)
+        {
+            output.returnCode = QFOMO_ERR_NOTHING_TO_CLAIM;
+            return;
+        }
+
+        if (state.get().dividendReserve < locals.claimAmount)
+        {
+            output.returnCode = QFOMO_ERR_RESERVE_MISMATCH;
+            return;
+        }
+
+        locals.transferResult = qpi.transfer(qpi.invocator(), locals.claimAmount);
+
+        if (locals.transferResult < 0)
+        {
+            output.returnCode = QFOMO_ERR_TRANSFER_FAILED;
+            return;
+        }
+
+        locals.playerAccount.pendingDividend = 0;
+        locals.playerAccount.totalClaimed += locals.claimAmount;
+
+        state.mut().playerAccounts.set(qpi.invocator(), locals.playerAccount);
+
+        state.mut().dividendReserve -= locals.claimAmount;
+
+        output.claimedAmount = locals.claimAmount;
+
+        output.remainingDividend = 0;
+        output.returnCode = QFOMO_SUCCESS;
     }
 
     PUBLIC_FUNCTION(GetGame)
@@ -455,6 +523,31 @@ struct QFOMO : public ContractBase
 
     END_TICK_WITH_LOCALS()
     {
+        if (state.get().round.status == QFOMO_STATUS_FINALIZED)
+        {
+            if (qpi.tick() <= state.get().round.finalizedTick)
+            {
+                return;
+            }
+
+            state.mut().round.roundId = state.get().round.roundId + 1;
+            state.mut().round.startTick = qpi.tick();
+            state.mut().round.endTick = qpi.tick() + QFOMO_DEFAULT_MAX_TIMER_TICKS;
+            state.mut().round.finalizedTick = 0;
+            state.mut().round.currentBidCount = 0;
+            state.mut().round.currentBidPrice = QFOMO_INITIAL_BID_PRICE;
+            state.mut().round.jackpot = 0;
+            state.mut().round.totalVolume = 0;
+            state.mut().round.recentDividendAccumulator = 0;
+            state.mut().round.oldDividendAccumulator = 0;
+            state.mut().round.lastBidder = NULL_ID;
+            state.mut().round.lastBidNumber = 0;
+            state.mut().round.status = QFOMO_STATUS_ACTIVE;
+            state.mut().totalRounds++;
+
+            return;
+        }
+        
         if (state.get().round.status != QFOMO_STATUS_ACTIVE || qpi.tick() < state.get().round.endTick)
         {
             return;
