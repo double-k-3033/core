@@ -95,6 +95,20 @@ struct QFOMO : public ContractBase
         sint64 totalClaimed;
     };
 
+    struct RoundSummary
+    {
+        uint32 roundId;
+        uint64 startTick;
+        uint64 endTick;
+        uint64 finalizedTick;
+        uint32 totalBids;
+        sint64 totalVolume;
+        sint64 jackpotPaid;
+        id winner;
+        uint32 winningBidNumber;
+    };
+
+
     struct StateData
     {
         Round round;
@@ -108,6 +122,8 @@ struct QFOMO : public ContractBase
 
         uint32 totalRounds;
         uint32 totalBids;
+
+        RoundSummary lastRound;
     };
 
     struct GetGame_input
@@ -146,6 +162,30 @@ struct QFOMO : public ContractBase
         sint64 pendingDividend;
         sint64 totalClaimed;
         uint32 exists;
+    };
+
+    struct GetLastRound_input
+    {
+    };
+
+    struct GetLastRound_output
+    {
+        uint32 exists;
+        uint32 roundId;
+
+        uint64 startTick;
+        uint64 endTick;
+        uint64 finalizedTick;
+
+        uint32 totalBids;
+
+        sint64 totalVolume;
+        sint64 jackpotPaid;
+
+        id winner;
+        uint32 winningBidNumber;
+
+        uint32 returnCode;
     };
 
     struct PlaceBid_input
@@ -199,6 +239,15 @@ struct QFOMO : public ContractBase
         state.mut().round.status = QFOMO_STATUS_ACTIVE;
         state.mut().totalRounds = 1;
         state.mut().totalBids = 0;
+        state.mut().lastRound.roundId = 0;
+        state.mut().lastRound.startTick = 0;
+        state.mut().lastRound.endTick = 0;
+        state.mut().lastRound.finalizedTick = 0;
+        state.mut().lastRound.totalBids = 0;
+        state.mut().lastRound.totalVolume = 0;
+        state.mut().lastRound.jackpotPaid = 0;
+        state.mut().lastRound.winner = NULL_ID;
+        state.mut().lastRound.winningBidNumber = 0;
     }
 
     struct PlaceBid_locals
@@ -507,17 +556,31 @@ struct QFOMO : public ContractBase
         }
     }
 
+    PUBLIC_FUNCTION(GetLastRound)
+    {
+        output.exists = state.get().lastRound.roundId > 0 ? 1 : 0;
+        output.roundId = state.get().lastRound.roundId;
+        output.startTick = state.get().lastRound.startTick;
+        output.endTick = state.get().lastRound.endTick;
+        output.finalizedTick = state.get().lastRound.finalizedTick;
+        output.totalBids = state.get().lastRound.totalBids;
+        output.totalVolume = state.get().lastRound.totalVolume;
+        output.jackpotPaid = state.get().lastRound.jackpotPaid;
+        output.winner = state.get().lastRound.winner;
+        output.winningBidNumber = state.get().lastRound.winningBidNumber;
+        output.returnCode = QFOMO_SUCCESS;
+    }
+
     struct END_TICK_locals
     {
         uint32 bidIndex;
 
         ActiveBid activeBid;
         PlayerAccount playerAccount;
-
         sint64 recentEarned;
         sint64 oldEarned;
         sint64 settledDividend;
-
+        sint64 jackpotPaid;
         sint64 transferResult;
     };
 
@@ -601,8 +664,10 @@ struct QFOMO : public ContractBase
             state.mut().activeBids.set(locals.bidIndex, locals.activeBid);
         }
         
+        locals.jackpotPaid = 0;
         if (state.get().round.currentBidCount > 0 && state.get().round.jackpot > 0)
         {
+            locals.jackpotPaid = state.get().round.jackpot;
             locals.transferResult = qpi.transfer(state.get().round.lastBidder, state.get().round.jackpot);
             if (locals.transferResult < 0)
             {
@@ -613,6 +678,15 @@ struct QFOMO : public ContractBase
 
         state.mut().round.currentBidPrice = 0;
         state.mut().round.finalizedTick = qpi.tick();
+        state.mut().lastRound.roundId = state.get().round.roundId;
+        state.mut().lastRound.startTick = state.get().round.startTick;
+        state.mut().lastRound.endTick = state.get().round.endTick;
+        state.mut().lastRound.finalizedTick = state.get().round.finalizedTick;
+        state.mut().lastRound.totalBids = state.get().round.currentBidCount;
+        state.mut().lastRound.totalVolume = state.get().round.totalVolume;
+        state.mut().lastRound.jackpotPaid = locals.jackpotPaid;
+        state.mut().lastRound.winner = state.get().round.currentBidCount > 0 ? state.get().round.lastBidder : NULL_ID;
+        state.mut().lastRound.winningBidNumber = state.get().round.currentBidCount > 0 ? state.get().round.lastBidNumber : 0;
         state.mut().round.status = QFOMO_STATUS_FINALIZED;
     }
 
@@ -623,5 +697,6 @@ struct QFOMO : public ContractBase
 
         REGISTER_USER_FUNCTION(GetGame, 1);
         REGISTER_USER_FUNCTION(GetPlayer, 2);
+        REGISTER_USER_FUNCTION(GetLastRound, 3);
     }
 };
