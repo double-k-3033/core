@@ -12,6 +12,36 @@ constexpr uint32 QFOMO_ALPHA_BPS = 5000; // 50% for dividends
 constexpr uint32 QFOMO_TEAM_BPS = 1000; // 10% for Team/Shareholders/Burn
 constexpr uint32 QFOMO_JACKPOT_BPS = 4000; // 40% for jackpot
 
+constexpr uint32 QFOMO_TEAM_WALLET_BPS = 300; // 3% of bid
+constexpr uint32 QFOMO_SHAREHOLDER_BPS = 500; // 5% of bid
+constexpr uint32 QFOMO_BURN_BPS = 200; // 2% of bid
+
+STATIC_ASSERT(
+    QFOMO_ALPHA_BPS +
+    QFOMO_TEAM_BPS +
+    QFOMO_JACKPOT_BPS ==
+    QFOMO_BPS,
+    invalid_primary_allocation
+);
+
+STATIC_ASSERT(
+    QFOMO_TEAM_WALLET_BPS +
+    QFOMO_SHAREHOLDER_BPS +
+    QFOMO_BURN_BPS ==
+    QFOMO_TEAM_BPS,
+    invalid_team_allocation
+);
+
+#define QFOMO_TEAM_WALLET ID( \
+    _K, _Z, _F, _J, _R, _T, _Y, _K, \
+    _J, _X, _V, _N, _P, _A, _Y, _X, \
+    _Q, _X, _U, _K, _M, _P, _K, _A, \
+    _H, _W, _W, _B, _W, _V, _W, _G, \
+    _L, _S, _F, _M, _E, _F, _O, _K, \
+    _P, _F, _J, _F, _W, _E, _D, _D, \
+    _X, _M, _C, _Z, _V, _S, _P, _E  \
+)
+
 constexpr uint32 QFOMO_GROWTH_BPS = 1000; // 10% growth per bid
 constexpr uint32 QFOMO_RECENT_WEIGHT_BPS = 4000; // 40% of dividend pool to recent group
 
@@ -124,6 +154,10 @@ struct QFOMO : public ContractBase
         uint32 totalBids;
 
         RoundSummary lastRound;
+
+        sint64 teamWalletReserve;
+        sint64 shareholderReserve;
+        sint64 burnReserve;
     };
 
     struct GetGame_input
@@ -150,6 +184,9 @@ struct QFOMO : public ContractBase
         uint32 status;
         uint32 totalRounds;
         uint32 totalBids;
+        sint64 teamWalletReserve;
+        sint64 shareholderReserve;
+        sint64 burnReserve;
     };
 
     struct GetPlayer_input
@@ -200,6 +237,10 @@ struct QFOMO : public ContractBase
         sint64 dividendAmount;
         sint64 teamAmount;
         sint64 jackpotAmount;
+
+        sint64 teamWalletAmount;
+        sint64 shareholderAmount;
+        sint64 burnAmount;
         
         sint64 nextBidPrice;
         sint64 totalJackpot;
@@ -248,6 +289,9 @@ struct QFOMO : public ContractBase
         state.mut().lastRound.jackpotPaid = 0;
         state.mut().lastRound.winner = NULL_ID;
         state.mut().lastRound.winningBidNumber = 0;
+        state.mut().teamWalletReserve = 0;
+        state.mut().shareholderReserve = 0;
+        state.mut().burnReserve = 0;
     }
 
     struct PlaceBid_locals
@@ -289,6 +333,10 @@ struct QFOMO : public ContractBase
 
         PlayerAccount playerAccount;
         sint64 playerAccountIndex;
+
+        sint64 teamWalletAmount;
+        sint64 shareholderAmount;
+        sint64 burnAmount;
     };
 
     PUBLIC_PROCEDURE_WITH_LOCALS(PlaceBid)
@@ -349,6 +397,10 @@ struct QFOMO : public ContractBase
         locals.dividendAmount = div<sint64>(state.get().round.currentBidPrice * QFOMO_ALPHA_BPS, QFOMO_BPS);
         locals.teamAmount = div<sint64>(state.get().round.currentBidPrice * QFOMO_TEAM_BPS, QFOMO_BPS);
         locals.jackpotAmount = state.get().round.currentBidPrice - locals.dividendAmount - locals.teamAmount;
+
+        locals.teamWalletAmount = div<sint64>(state.get().round.currentBidPrice * QFOMO_TEAM_WALLET_BPS, QFOMO_BPS);
+        locals.shareholderAmount = div<sint64>(state.get().round.currentBidPrice * QFOMO_SHAREHOLDER_BPS, QFOMO_BPS);
+        locals.burnAmount = locals.teamAmount - locals.teamWalletAmount - locals.shareholderAmount;
         
         locals.acceptedBidPrice = state.get().round.currentBidPrice;
 
@@ -369,6 +421,9 @@ struct QFOMO : public ContractBase
 
         state.mut().dividendReserve += locals.assignedDividendAmount;
         state.mut().teamReserve += locals.teamAmount;
+        state.mut().teamWalletReserve += locals.teamWalletAmount;
+        state.mut().shareholderReserve += locals.shareholderAmount;
+        state.mut().burnReserve += locals.burnAmount;
         state.mut().round.jackpot += locals.jackpotAmount;
         state.mut().round.totalVolume += locals.acceptedBidPrice;
 
@@ -444,6 +499,9 @@ struct QFOMO : public ContractBase
         output.acceptedBidPrice = locals.acceptedBidPrice;
         output.dividendAmount = locals.dividendAmount;
         output.teamAmount = locals.teamAmount;
+        output.teamWalletAmount = locals.teamWalletAmount;
+        output.shareholderAmount = locals.shareholderAmount;
+        output.burnAmount = locals.burnAmount;
         output.jackpotAmount = locals.jackpotAmount;
         output.nextBidPrice = state.get().round.currentBidPrice;
         output.totalJackpot = state.get().round.jackpot;
@@ -526,6 +584,9 @@ struct QFOMO : public ContractBase
         output.currentBidPrice = state.get().round.currentBidPrice;
         output.dividendReserve = state.get().dividendReserve;
         output.teamReserve = state.get().teamReserve;
+        output.teamWalletReserve = state.get().teamWalletReserve;
+        output.shareholderReserve = state.get().shareholderReserve;
+        output.burnReserve = state.get().burnReserve;
         output.jackpot = state.get().round.jackpot;
         output.totalVolume = state.get().round.totalVolume;
         output.lastBidder = state.get().round.lastBidder;
@@ -582,6 +643,13 @@ struct QFOMO : public ContractBase
         sint64 settledDividend;
         sint64 jackpotPaid;
         sint64 transferResult;
+
+        sint64 componentReserveTotal;
+
+        sint64 teamWalletPayout;
+        sint64 shareholderAmountPerShare;
+        sint64 shareholderPayout;
+        sint64 burnPayout;
     };
 
     END_TICK_WITH_LOCALS()
@@ -664,7 +732,60 @@ struct QFOMO : public ContractBase
             state.mut().activeBids.set(locals.bidIndex, locals.activeBid);
         }
         
+        locals.componentReserveTotal = state.get().teamWalletReserve + state.get().shareholderReserve + state.get().burnReserve;
+
+        if (locals.componentReserveTotal != state.get().teamReserve)
+        {
+            return;
+        }
+
+        locals.teamWalletPayout = state.get().teamWalletReserve;
+
+        if (locals.teamWalletPayout > 0)
+        {
+            locals.transferResult = qpi.transfer(QFOMO_TEAM_WALLET, locals.teamWalletPayout);
+
+            if (locals.transferResult < 0)
+            {
+                return;
+            }
+
+            state.mut().teamWalletReserve = 0;
+            state.mut().teamReserve -= locals.teamWalletPayout;
+        }
+
+        locals.shareholderAmountPerShare = div<sint64>(state.get().shareholderReserve, NUMBER_OF_COMPUTORS);
+
+        if (locals.shareholderAmountPerShare > 0)
+        {
+            locals.shareholderPayout = locals.shareholderAmountPerShare * NUMBER_OF_COMPUTORS;
+
+            if (!qpi.distributeDividends(locals.shareholderAmountPerShare))
+            {
+                return;
+            }
+
+            state.mut().shareholderReserve -= locals.shareholderPayout;
+            state.mut().teamReserve -= locals.shareholderPayout;
+        }
+
+        locals.burnPayout = state.get().burnReserve;
+
+        if (locals.burnPayout > 0)
+        {
+            locals.transferResult = qpi.transfer(NULL_ID, locals.burnPayout);
+
+            if (locals.transferResult < 0)
+            {
+                return;
+            }
+
+            state.mut().burnReserve = 0;
+            state.mut().teamReserve -= locals.burnPayout;
+        }
+
         locals.jackpotPaid = 0;
+
         if (state.get().round.currentBidCount > 0 && state.get().round.jackpot > 0)
         {
             locals.jackpotPaid = state.get().round.jackpot;
