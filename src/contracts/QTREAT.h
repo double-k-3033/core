@@ -282,7 +282,7 @@ struct QTREAT : public ContractBase
         // ---- QDOGE staking ----
         HashMap<id, StakerInfo, QTREAT_MAX_STAKERS> stakers;
         uint64 totalStaked;
-        uint64 stakingStartEpoch;    // set on first BEGIN_EPOCH; phases run 156 epochs from here
+        uint64 stakingStartEpoch;    // set on first BEGIN_EPOCH; the program runs 52 epochs from here
 
         // ---- QTREAT bonus token pool (held by SC, loaded by admin) ----
         uint64 qtreatBonusPool;
@@ -430,7 +430,7 @@ struct QTREAT : public ContractBase
     struct GetPhaseInfo_output
     {
         uint64 stakingStartEpoch;  // 0 = phases not started yet
-        uint64 currentPhase;       // 1..3 while active, 0 = not started or ended
+        uint64 currentPhase;       // 1 while active, 0 = not started or ended
         uint64 epochsRemaining;    // reward epochs left across all phases
     };
     struct GetPhaseInfo_locals { uint64 elapsed; };
@@ -489,7 +489,7 @@ struct QTREAT : public ContractBase
         locals.elapsed = qpi.epoch() - state.get().stakingStartEpoch;
         if (locals.elapsed < QTREAT_TOTAL_REWARD_EPOCHS)
         {
-            output.currentPhase = div(locals.elapsed, QTREAT_PHASE_EPOCHS) + 1; // 1..3
+            output.currentPhase = div(locals.elapsed, QTREAT_PHASE_EPOCHS) + 1; // always 1 (single 52-epoch phase)
             output.epochsRemaining = QTREAT_TOTAL_REWARD_EPOCHS - locals.elapsed;
         }
     }
@@ -1411,6 +1411,7 @@ struct QTREAT : public ContractBase
         uint64 amount; sint64 idx; uint64 beginBal; uint64 endBal; uint64 eligible;
         uint64 nftCnt; uint64 totalEligible; sint64 exIdx; uint64 isExcluded;
         uint64 shareholderShare; uint64 perShare; uint64 paidShareholders;
+        uint64 reservedDividend; uint64 distributedDividend;
         // QDOGE drip
         uint64 dripRate; uint64 dripDue; sint64 dripIdx; uint64 dripPacked; uint64 dripRarity;
         sint64 dripXfer; sint64 dripManaged; uint64 dripAccounted; StakerInfo dripStakerInfo;
@@ -1452,7 +1453,20 @@ struct QTREAT : public ContractBase
 
             locals.info.unstakeAmount = 0;
             locals.info.unstakeEpoch = 0;
-            state.mut().stakers.set(locals.h, locals.info);
+            // Fully exited with no outstanding bonus obligations: drop the
+            // record so the stakers map doesn't accumulate dead entries over
+            // the program's life (mirrors FinalizeUnstake). Removing the
+            // current element during a forward nextElementIndex walk is safe:
+            // it only marks this slot, which the scan has already passed.
+            if (locals.info.staked == 0 && locals.info.pendingBonus == 0
+                && locals.info.bonusAwarded == 0)
+            {
+                state.mut().stakers.removeByKey(locals.h);
+            }
+            else
+            {
+                state.mut().stakers.set(locals.h, locals.info);
+            }
         }
 
         qpi.getEntity(SELF, locals.ent);
@@ -1731,6 +1745,11 @@ struct QTREAT : public ContractBase
         // least one verified rig is registered.
         if (state.get().totalMiningWeight > 0 && state.get().miningFund > 0)
         {
+            // Re-read the live balance: the raffle entropy fee and bonus
+            // delivery release fees since the section-0 snapshot left
+            // contractBalance stale.
+            qpi.getEntity(SELF, locals.ent);
+            locals.contractBalance = locals.ent.incomingAmount - locals.ent.outgoingAmount;
             locals.miningBudget = state.get().miningRewardRate;
             if (locals.miningBudget > state.get().miningFund) locals.miningBudget = state.get().miningFund;
 
@@ -1864,13 +1883,24 @@ struct QTREAT : public ContractBase
         // the weight of exactly 1 QTREAT token. NFT-only wallets are paid
         // in a second loop over the registry.
         if (state.get().dividendFund == 0) return;
+        // Re-read the live balance after mining + drip payouts so the payout
+        // cap reflects the true contract balance (raffle/bonus/drip fees left
+        // the earlier snapshot stale).
+        qpi.getEntity(SELF, locals.ent);
+        locals.contractBalance = locals.ent.incomingAmount - locals.ent.outgoingAmount;
         locals.amount = state.get().dividendFund;
         if (locals.amount > locals.contractBalance) locals.amount = locals.contractBalance;
         locals.totalEligible = sadd(state.get().totalHoldersSnapshot, state.get().totalNftCount);
         if (locals.amount == 0 || locals.totalEligible == 0) return;
 
-        state.mut().dividendFund = state.get().dividendFund - locals.amount;
-        state.mut().totalDividendsDistributed = sadd(state.get().totalDividendsDistributed, locals.amount);
+        // Reserve the payout from the fund now; any portion NOT actually
+        // distributed — because a holder's min(begin,end) weight is below
+        // their begin-snapshot balance, or the balance is drained — is
+        // returned to dividendFund at the end (see reconcile below) so it
+        // rolls into next epoch instead of being stranded in the contract.
+        locals.reservedDividend = locals.amount;
+        locals.distributedDividend = 0;
+        state.mut().dividendFund = state.get().dividendFund - locals.reservedDividend;
 
         // ---- 3a. Shareholder cut: 5% to the 676 IPO shares ----
         // distributeDividends pays per-share natively; the integer remainder
@@ -1881,6 +1911,7 @@ struct QTREAT : public ContractBase
         {
             locals.paidShareholders = locals.perShare * (uint64)NUMBER_OF_COMPUTORS;
             locals.amount -= locals.paidShareholders;
+            locals.distributedDividend = locals.paidShareholders;
             locals.contractBalance = (locals.contractBalance > locals.paidShareholders)
                 ? locals.contractBalance - locals.paidShareholders : 0;
             state.mut().totalShareholderDividends = sadd(state.get().totalShareholderDividends, locals.paidShareholders);
@@ -1910,7 +1941,8 @@ struct QTREAT : public ContractBase
 
             qpi.transfer(locals.h, locals.reward);
             locals.contractBalance -= locals.reward;
-            if (locals.contractBalance == 0) return;
+            locals.distributedDividend = sadd(locals.distributedDividend, locals.reward);
+            if (locals.contractBalance == 0) break;
         }
 
         // Pass 2: NFT-only wallets (no entry in the begin snapshot).
@@ -1942,8 +1974,19 @@ struct QTREAT : public ContractBase
 
             qpi.transfer(locals.h, locals.reward);
             locals.contractBalance -= locals.reward;
-            if (locals.contractBalance == 0) return;
+            locals.distributedDividend = sadd(locals.distributedDividend, locals.reward);
+            if (locals.contractBalance == 0) break;
         }
+
+        // Return the undistributed reserve to the fund; record only what was
+        // actually paid out this epoch (see the reservation note above).
+        if (locals.reservedDividend > locals.distributedDividend)
+        {
+            state.mut().dividendFund = sadd(state.get().dividendFund,
+                locals.reservedDividend - locals.distributedDividend);
+        }
+        state.mut().totalDividendsDistributed =
+            sadd(state.get().totalDividendsDistributed, locals.distributedDividend);
     }
 
     // ======================== Staking entry point ========================
