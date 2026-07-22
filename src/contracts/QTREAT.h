@@ -210,6 +210,7 @@ constexpr uint32 QTREAT_ERR_INSUFFICIENT_FEE = 11;
 constexpr uint32 QTREAT_ERR_INVALID_INPUT = 12;
 constexpr uint32 QTREAT_ERR_PHASES_ENDED = 13;
 constexpr uint32 QTREAT_ERR_BONUS_POOL_EMPTY = 14;
+constexpr uint32 QTREAT_ERR_EXTERNAL_CALL = 15;
 
 struct QTREAT2 {};
 
@@ -359,7 +360,7 @@ struct QTREAT : public ContractBase
     // non-QDOGE asset back to QX (qRWA/MSVAULT pattern).
     struct ReleaseManagedShares_input { Asset asset; uint64 amount; };
     struct ReleaseManagedShares_output { uint32 returnCode; };
-    struct ReleaseManagedShares_locals { sint64 managed; sint64 rel; };
+    struct ReleaseManagedShares_locals { sint64 managed; sint64 rel; StakerInfo info; uint64 accounted; };
 
     struct SetExcludeAddress_input { uint64 slot; id address; };
     struct SetExcludeAddress_output { uint32 returnCode; };
@@ -639,6 +640,15 @@ struct QTREAT : public ContractBase
         locals.info.staked -= input.amount;
         locals.info.unstakeAmount = input.amount;
         locals.info.unstakeEpoch = qpi.epoch();
+        // Full exit: reset the consecutive-epoch counters now. The END_EPOCH
+        // pass is skipped when this is the last staker (totalStaked==0), so a
+        // retained record could otherwise carry a stale streak into a restake.
+        if (locals.info.staked == 0)
+        {
+            locals.info.bonusEpochs = 0;
+            locals.info.growthStreak = 0;
+            locals.info.lastStaked = 0;
+        }
         state.mut().stakers.set(qpi.invocator(), locals.info);
         state.mut().totalStaked = state.get().totalStaked - input.amount;
         output.returnCode = QTREAT_OK;
@@ -727,15 +737,20 @@ struct QTREAT : public ContractBase
             state.get().qtreatToken.assetName, state.get().qtreatToken.issuer,
             SELF, SELF, (sint64)locals.info.pendingBonus, qpi.invocator());
         if (locals.xfer < 0) { output.returnCode = QTREAT_ERR_TRANSFER_FAILED; return; }
-        locals.rel = qpi.releaseShares(state.get().qtreatToken, qpi.invocator(), qpi.invocator(),
-            (sint64)locals.info.pendingBonus, QTREAT_QX_CONTRACT_INDEX, QTREAT_QX_CONTRACT_INDEX,
-            QTREAT_QX_TRANSFER_FEE);
-        if (locals.rel < 0) { output.returnCode = QTREAT_ERR_TRANSFER_FAILED; return; }
 
+        // Ownership transferred — commit accounting BEFORE the release (as the
+        // auto-delivery does). On release failure the claimer still owns the
+        // tokens (self-releasable); a retry can't double-pay since SELF no
+        // longer holds them.
         state.mut().qtreatBonusPool = state.get().qtreatBonusPool - locals.info.pendingBonus;
         output.claimed = locals.info.pendingBonus;
         locals.info.pendingBonus = 0;
         state.mut().stakers.set(qpi.invocator(), locals.info);
+
+        locals.rel = qpi.releaseShares(state.get().qtreatToken, qpi.invocator(), qpi.invocator(),
+            (sint64)output.claimed, QTREAT_QX_CONTRACT_INDEX, QTREAT_QX_CONTRACT_INDEX,
+            QTREAT_QX_TRANSFER_FEE);
+        // Release failure is non-fatal: the bonus is delivered and self-releasable.
         output.returnCode = QTREAT_OK;
     }
 
@@ -753,38 +768,52 @@ struct QTREAT : public ContractBase
             { qpi.invocator(), SELF_INDEX }, { qpi.invocator(), SELF_INDEX });
         if (locals.managed < (sint64)input.amount) { output.returnCode = QTREAT_ERR_ACQUIRE_FAILED; return; }
 
+        // Ensure the accounting slot exists BEFORE the irreversible transfer:
+        // a new key must fit, else custody moves with no recorded balance.
+        locals.key.issuer = input.asset.issuer;
+        locals.key.assetName = input.asset.assetName;
+        if (!state.get().generalAssetBalances.contains(locals.key)
+            && state.get().generalAssetBalances.population() >= QTREAT_MAX_ASSETS)
+        {
+            output.returnCode = QTREAT_ERR_INVALID_INPUT; return;
+        }
+
         locals.xfer = qpi.transferShareOwnershipAndPossession(
             input.asset.assetName, input.asset.issuer,
             qpi.invocator(), qpi.invocator(), (sint64)input.amount, SELF);
         if (locals.xfer < 0) { output.returnCode = QTREAT_ERR_TRANSFER_FAILED; return; }
 
-        locals.key.issuer = input.asset.issuer;
-        locals.key.assetName = input.asset.assetName;
         locals.bal = 0;
         state.get().generalAssetBalances.get(locals.key, locals.bal);
         state.mut().generalAssetBalances.set(locals.key, sadd(locals.bal, input.amount));
         output.returnCode = QTREAT_OK;
     }
 
-    // Anyone: release YOUR OWN managed shares of a non-QDOGE asset back to
-    // QX, so tokens whose management rights were transferred here by mistake
-    // become tradable again. QDOGE is excluded — QDOGE under management IS
-    // the stake and leaves only via the RequestUnstake/FinalizeUnstake flow.
+    // Anyone: release YOUR OWN managed shares back to QX. Non-QDOGE: the whole
+    // managed balance. QDOGE: only the surplus above staked + pending unstake,
+    // so stranded drip QDOGE is recoverable but the stake stays locked.
     // Causer pays the QX release fee.
     PUBLIC_PROCEDURE_WITH_LOCALS(ReleaseManagedShares)
     {
-        if (input.asset.assetName == state.get().qdogeToken.assetName
-            && input.asset.issuer == state.get().qdogeToken.issuer)
-        {
-            if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
-            output.returnCode = QTREAT_ERR_INVALID_INPUT; return;
-        }
         locals.managed = qpi.numberOfShares(input.asset,
             { qpi.invocator(), SELF_INDEX }, { qpi.invocator(), SELF_INDEX });
         if (input.amount == 0 || locals.managed < (sint64)input.amount)
         {
             if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
             output.returnCode = QTREAT_ERR_INVALID_INPUT; return;
+        }
+        if (input.asset.assetName == state.get().qdogeToken.assetName
+            && input.asset.issuer == state.get().qdogeToken.issuer)
+        {
+            // Protect the stake: only managed - staked - pending is releasable.
+            locals.info.staked = 0; locals.info.unstakeAmount = 0;
+            state.get().stakers.get(qpi.invocator(), locals.info);
+            locals.accounted = sadd(locals.info.staked, locals.info.unstakeAmount);
+            if ((sint64)locals.accounted + (sint64)input.amount > locals.managed)
+            {
+                if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+                output.returnCode = QTREAT_ERR_INVALID_INPUT; return;
+            }
         }
         if (qpi.invocationReward() < QTREAT_QX_TRANSFER_FEE)
         {
@@ -884,6 +913,11 @@ struct QTREAT : public ContractBase
             // Ownership proof: QBAY's on-chain possessor must be the caller.
             locals.qbayIn.NFTId = locals.partId;
             CALL_OTHER_CONTRACT_FUNCTION(QBAY, getInfoOfNFTById, locals.qbayIn, locals.qbayOut);
+            // A failed QBAY call leaves qbayOut stale; never accept it as proof.
+            if (interContractCallError != NoCallError)
+            {
+                output.returnCode = QTREAT_ERR_EXTERNAL_CALL; return;
+            }
             if (locals.qbayOut.possessor != qpi.invocator())
             {
                 output.returnCode = QTREAT_ERR_ACCESS_DENIED; return;
@@ -1416,7 +1450,7 @@ struct QTREAT : public ContractBase
         uint64 dripRate; uint64 dripDue; sint64 dripIdx; uint64 dripPacked; uint64 dripRarity;
         sint64 dripXfer; sint64 dripManaged; uint64 dripAccounted; StakerInfo dripStakerInfo;
         // mining payout
-        AsicRig rig; uint64 miningBudget; uint64 minerReward; uint64 stillOwned; uint32 rigPartId; sint64 pIdx;
+        AsicRig rig; uint64 miningBudget; uint64 minerReward; uint64 stillOwned; uint32 rigPartId; sint64 pIdx; uint64 verifyOk;
         QBAY::getInfoOfNFTById_input qbayIn; QBAY::getInfoOfNFTById_output qbayOut;
         Entity ent; uint64 contractBalance;
     };
@@ -1453,11 +1487,9 @@ struct QTREAT : public ContractBase
 
             locals.info.unstakeAmount = 0;
             locals.info.unstakeEpoch = 0;
-            // Fully exited with no outstanding bonus obligations: drop the
-            // record so the stakers map doesn't accumulate dead entries over
-            // the program's life (mirrors FinalizeUnstake). Removing the
-            // current element during a forward nextElementIndex walk is safe:
-            // it only marks this slot, which the scan has already passed.
+            // Fully exited, no bonus owed: drop the record (mirrors
+            // FinalizeUnstake). Removing the current element mid-walk is safe —
+            // it only marks a slot the forward scan has already passed.
             if (locals.info.staked == 0 && locals.info.pendingBonus == 0
                 && locals.info.bonusAwarded == 0)
             {
@@ -1631,6 +1663,13 @@ struct QTREAT : public ContractBase
                 locals.entropyIn.trustee = id::zero();
                 INVOKE_OTHER_CONTRACT_PROCEDURE(RANDOM, BuyEntropy, locals.entropyIn, locals.entropyOut, (sint64)QTREAT_RAFFLE_ENTROPY_FEE);
 
+                // Invoke failed (RANDOM inactive/errored): the fee never left,
+                // so restore it. (Zero-entropy refunds come via POST_INCOMING.)
+                if (interContractCallError != NoCallError)
+                {
+                    state.mut().stakingFund = sadd(state.get().stakingFund, QTREAT_RAFFLE_ENTROPY_FEE);
+                }
+
                 if (interContractCallError == NoCallError && !(locals.entropyOut.entropy == locals.zeroEntropy))
                 {
                     // Hash entropy with draw context before deriving the winner.
@@ -1714,6 +1753,7 @@ struct QTREAT : public ContractBase
             locals.rig = state.get().asicRigs.get(locals.sidx);
             if (locals.rig.active == 0) continue;
             locals.stillOwned = 1;
+            locals.verifyOk = 1;
             for (locals.pIdx = 0; locals.pIdx < 4; locals.pIdx++)
             {
                 if (locals.pIdx == 0) locals.rigPartId = locals.rig.partMotherboard;
@@ -1722,12 +1762,15 @@ struct QTREAT : public ContractBase
                 if (locals.pIdx == 3) locals.rigPartId = locals.rig.partFan;
                 locals.qbayIn.NFTId = locals.rigPartId;
                 CALL_OTHER_CONTRACT_FUNCTION(QBAY, getInfoOfNFTById, locals.qbayIn, locals.qbayOut);
+                // On error qbayOut is stale; treat as inconclusive and leave
+                // the rig untouched (retried next epoch).
+                if (interContractCallError != NoCallError) { locals.verifyOk = 0; break; }
                 if (locals.qbayOut.possessor != locals.rig.owner)
                 {
                     locals.stillOwned = 0;
                 }
             }
-            if (locals.stillOwned == 0)
+            if (locals.verifyOk == 1 && locals.stillOwned == 0)
             {
                 state.mut().asicUsedParts.removeByKey((uint64)locals.rig.partMotherboard);
                 state.mut().asicUsedParts.removeByKey((uint64)locals.rig.partChip);
@@ -1745,9 +1788,8 @@ struct QTREAT : public ContractBase
         // least one verified rig is registered.
         if (state.get().totalMiningWeight > 0 && state.get().miningFund > 0)
         {
-            // Re-read the live balance: the raffle entropy fee and bonus
-            // delivery release fees since the section-0 snapshot left
-            // contractBalance stale.
+            // Re-read live balance: raffle/bonus fees left the earlier
+            // snapshot stale.
             qpi.getEntity(SELF, locals.ent);
             locals.contractBalance = locals.ent.incomingAmount - locals.ent.outgoingAmount;
             locals.miningBudget = state.get().miningRewardRate;
@@ -1783,7 +1825,20 @@ struct QTREAT : public ContractBase
             {
                 locals.qbayIn.NFTId = state.get().dividendNftIds.get(locals.sidx);
                 CALL_OTHER_CONTRACT_FUNCTION(QBAY, getInfoOfNFTById, locals.qbayIn, locals.qbayOut);
+                // Skip on QBAY error: stale qbayOut would credit the wrong id.
+                if (interContractCallError != NoCallError) continue;
                 if (locals.qbayOut.possessor == NULL_ID || locals.qbayOut.possessor == SELF) continue;
+                // Keep excluded addresses out of the dividend denominator.
+                locals.isExcluded = 0;
+                for (locals.exIdx = 0; locals.exIdx < (sint64)QTREAT_MAX_EXCLUDE_ADDRESSES; locals.exIdx++)
+                {
+                    if (state.get().excludeAddresses.get(locals.exIdx) != NULL_ID
+                        && locals.qbayOut.possessor == state.get().excludeAddresses.get(locals.exIdx))
+                    {
+                        locals.isExcluded = 1;
+                    }
+                }
+                if (locals.isExcluded != 0) continue;
                 locals.existing = 0;
                 state.get().nftCounts.get(locals.qbayOut.possessor, locals.existing);
                 state.mut().nftCounts.set(locals.qbayOut.possessor, locals.existing + 1);
@@ -1811,6 +1866,7 @@ struct QTREAT : public ContractBase
                 locals.dripPacked = state.get().asicCatalog.value(locals.dripIdx);
                 locals.dripRarity = mod(locals.dripPacked, 8ULL);
                 CALL_OTHER_CONTRACT_FUNCTION(QBAY, getInfoOfNFTById, locals.qbayIn, locals.qbayOut);
+                if (interContractCallError != NoCallError) continue; // skip on error (stale possessor)
                 if (locals.qbayOut.possessor == NULL_ID || locals.qbayOut.possessor == SELF) continue;
                 if (locals.qbayOut.possessor == state.get().adminAddress) continue; // unsold inventory
 
@@ -1883,9 +1939,7 @@ struct QTREAT : public ContractBase
         // the weight of exactly 1 QTREAT token. NFT-only wallets are paid
         // in a second loop over the registry.
         if (state.get().dividendFund == 0) return;
-        // Re-read the live balance after mining + drip payouts so the payout
-        // cap reflects the true contract balance (raffle/bonus/drip fees left
-        // the earlier snapshot stale).
+        // Re-read live balance after mining + drip so the payout cap is accurate.
         qpi.getEntity(SELF, locals.ent);
         locals.contractBalance = locals.ent.incomingAmount - locals.ent.outgoingAmount;
         locals.amount = state.get().dividendFund;
@@ -1893,11 +1947,9 @@ struct QTREAT : public ContractBase
         locals.totalEligible = sadd(state.get().totalHoldersSnapshot, state.get().totalNftCount);
         if (locals.amount == 0 || locals.totalEligible == 0) return;
 
-        // Reserve the payout from the fund now; any portion NOT actually
-        // distributed — because a holder's min(begin,end) weight is below
-        // their begin-snapshot balance, or the balance is drained — is
-        // returned to dividendFund at the end (see reconcile below) so it
-        // rolls into next epoch instead of being stranded in the contract.
+        // Reserve from the fund; whatever isn't actually distributed (min()
+        // shortfall or drained balance) is returned below so it rolls forward
+        // instead of being stranded.
         locals.reservedDividend = locals.amount;
         locals.distributedDividend = 0;
         state.mut().dividendFund = state.get().dividendFund - locals.reservedDividend;
@@ -1978,8 +2030,7 @@ struct QTREAT : public ContractBase
             if (locals.contractBalance == 0) break;
         }
 
-        // Return the undistributed reserve to the fund; record only what was
-        // actually paid out this epoch (see the reservation note above).
+        // Return the undistributed reserve; record only what was paid.
         if (locals.reservedDividend > locals.distributedDividend)
         {
             state.mut().dividendFund = sadd(state.get().dividendFund,
@@ -2069,12 +2120,9 @@ struct QTREAT : public ContractBase
         }
         if (state.mut().stakers.set(input.owner, locals.info) == NULL_INDEX)
         {
-            // Map full (PRE guards against this; defense-in-depth): hand the
-            // shares straight back to QX so they remain tradable instead of
-            // freezing them under our management with no staker record.
-            qpi.releaseShares(state.get().qdogeToken, input.owner, input.possessor,
-                input.numberOfShares, QTREAT_QX_CONTRACT_INDEX, QTREAT_QX_CONTRACT_INDEX,
-                QTREAT_QX_TRANSFER_FEE);
+            // Unreachable: PRE rejects new stakers at capacity and set() reuses
+            // removed slots, so it can't fail here. Asset APIs are illegal in
+            // this callback anyway, so just don't credit a record-less stake.
             return;
         }
         state.mut().totalStaked = sadd(state.get().totalStaked, (uint64)input.numberOfShares);
