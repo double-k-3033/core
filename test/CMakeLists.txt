@@ -37,6 +37,7 @@ add_executable(
   contract_qraffle.cpp
   contract_qusino.cpp
   contract_qtreat.cpp
+  contract_qrewards.cpp
   contract_random.cpp
   contract_vottunbridge.cpp
   # kangaroo_twelve.cpp

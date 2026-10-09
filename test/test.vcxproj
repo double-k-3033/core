@@ -159,6 +159,7 @@
     <ClCompile Include="contract_qip.cpp" />
     <ClCompile Include="contract_qusino.cpp" />
     <ClCompile Include="contract_qtreat.cpp" />
+    <ClCompile Include="contract_qrewards.cpp" />
     <ClCompile Include="contract_qpayhub.cpp" />
     <ClCompile Include="execution_fees.cpp" />
     <ClCompile Include="stable_computor_index.cpp" />
