@@ -2,132 +2,145 @@ using namespace QPI;
 
 // QREWARDS (multi-pool) - open ecosystem loyalty & dividend platform.
 //
-// Anyone can createPool(): each pool has its own creator/admin and its own asset
-// registry. Holding a pool's registered assets earns a weighted "share" of that
-// pool's dividends.
+// Anyone can createPool(): each pool has its own creator/admin, its own asset registry and its
+// own dividend pots. Deposits (minus a 5% fee) accumulate into per-currency pots and are paid
+// out automatically once per epoch -- there is no claim step.
 //
-// DISTRIBUTION MODEL (pure snapshot, qRWA-style):
-//   Dividends are NOT tracked as a persistent soulbound balance. Instead, each
-//   deposit (minus the 5% fee) accumulates into a per-currency POT for the pool.
-//   At END_EPOCH the contract reads LIVE holdings straight from the asset ledger,
-//   computes each holder's weight (per-asset points x concentration multiplier x
-//   price weight, exactly like previewWeight), and pays out the pot pro-rata by
-//   weight. Because every epoch reads the real ledger, a holder who sold cannot be
-//   paid (their live balance is 0) and the same tokens can never be counted twice
-//   -- there are no stale "ghost" positions. This is why there is no claim/sync
-//   step and no persistent per-user balance.
+// LOCK-AND-JOIN MODEL:
+//   A holder LOCKS registered assets by moving their share management rights to QREWARDS
+//   (QX.TransferShareManagementRights -> QREWARDS; ownership and possession never change) and
+//   calls join(pool) once (small fee, burned into the contract's execution-fee reserve). Only
+//   locked shares count. Each epoch the distribution engine walks the pool's MEMBERS -- never the
+//   asset ledger -- reading each member's locked balance with one O(1) lookup per asset. Locked
+//   shares can only leave QREWARDS management through TransferShareManagementRights, which is
+//   refused while a distribution cycle runs, so the same shares cannot be shuttled between members
+//   to be measured or paid twice. Outside cycles holders unlock freely; a member whose locked
+//   weight is 0 at the next cycle is pruned. Token dividends paid in a registered asset arrive
+//   already locked. In list mode the members are an admin-uploaded weighted wallet list.
 //
-// Each pool can pay dividends in up to QREWARDS_MAX_DIV_CURRENCIES currencies
-// (slot 0 = QU by default; pool admin can add asset currencies, e.g. QDOGE).
-// Pools are fully isolated: a pool can only ever pay out what was deposited to it.
+// BOUNDED WORK (no unbounded loops anywhere):
+//   * Distribution runs only in END_TICK, at most streamBatchSize work units per tick. Every unit
+//     is O(1): one member (<= MAX_ASSETS_PER_POOL lookups and <= MAX_DIV_CURRENCIES transfers) or
+//     one pass over a pool's NFT registry (<= MAX_NFT_PER_POOL QBAY lookups). A tick therefore
+//     never does more than a fixed amount of work or more than a fixed number of QU transfers.
+//   * END_EPOCH only collects operating fees (one O(1) step per pool) and flushes fees.
+//   * Member lookups use an index map kept at <= 50% load and keyed by K12(pool, wallet), so
+//     join/leave/exclude are O(1) and cannot be degraded by grinding raw wallet ids.
 //
-// NOTE ON SCALE: END_EPOCH distribution iterates each active pool's registered
-// assets' holders. It is designed for a handful of active pools of up to a few
-// thousand holders each (QREWARDS_SNAPSHOT_CAP). It is NOT a mass multi-tenant
-// sweep of thousands of busy pools in one epoch.
+// PAYOUT RULE: a cycle first MEASURES every member (weight w1, summed into W), then PAYS each
+//   member pot * min(w1, w2) / W where w2 is re-read at payment time. Locked shares cannot move
+//   between members during a cycle (unlocking is refused), and a member whose locked balance fell
+//   since MEASURE (e.g. by depositing it) is paid on the lower figure, so the sum of payouts can
+//   never exceed the frozen pot; any remainder carries to the next cycle.
 //
-// NOTE ON TIMING: distribution uses the END_EPOCH snapshot only. That fully
-// prevents stale/ghost over-payment, but does not by itself stop someone buying
-// a large position right before the epoch boundary to grab that epoch's dividend
-// (and selling after). A min(begin,end) rule would require a BEGIN_EPOCH snapshot;
-// see docs/qrewards-build-guide.md.
-//
-// See docs/qrewards-build-guide.md for the full design rationale.
+// NEVER PAYS CONTRACTS: contract ids (and NULL_ID) can neither join, be listed, be a pool admin,
+//   nor receive shareholder dividends. Paying a contract runs its POST_INCOMING_TRANSFER, which
+//   aborts the payer -- and with no contract timeout halts the node -- if that contract is in an
+//   error state or not yet constructed. For the same reason QREWARDS itself defines no
+//   POST_INCOMING_TRANSFER: QU sent to it before construction (or after a failed IPO) cannot trap
+//   the sender. Pools are funded with depositDividend.
 
-constexpr uint32 QREWARDS_MAX_POOLS            = 1024;
-constexpr uint32 QREWARDS_MAX_ASSETS_PER_POOL  = 64;
-constexpr uint32 QREWARDS_MAX_DIV_CURRENCIES   = 4;          // QU + up to 3 assets per pool
-constexpr uint32 QREWARDS_MAX_BATCH            = 16;         // assets per registerAssets call
-// FIX: 24 is not a power of 2. Any QPI build whose Array<T,N> enforces a power-of-2 capacity
-// (a standard requirement -- see qpi.h's static_assert on L && !(L & (L-1))) fails to compile
-// addRecipients_input's Array<id,N>/Array<uint64,N> fields at N=24. 32 would exceed the
-// documented MAX_INPUT_SIZE=1024 budget for this struct (12 + 40*32 = 1292 bytes), so 16 is the
-// largest power-of-2 batch size that still fits (12 + 40*16 = 652 bytes).
-constexpr uint32 QREWARDS_MAX_RECIP_BATCH      = 16;         // recipients per addRecipients call (MAX_INPUT_SIZE=1024)
-constexpr uint64 QREWARDS_MAX_RECIPIENTS       = 1048576;    // 2^20: shared recipient-list entries across ALL pools
-                                                            // (~96MB of the 1GB state budget; ~209 pools at the per-pool cap)
-constexpr uint32 QREWARDS_MAX_LIST_PER_POOL    = 5000;      // hard cap on list-mode recipients per pool (< SNAPSHOT_CAP,
-                                                            // so every recipient in a list pool is always paid in full each epoch)
-constexpr uint64 QREWARDS_MAX_FUNDERS          = 65536;      // sender->pool routing entries for tagged QU transfers
-constexpr uint32 QREWARDS_PAGE                 = 256;        // page size for paginated views
-constexpr uint64 QREWARDS_SNAPSHOT_CAP         = 16384;      // 2^14: max unique holders per pool in one epoch snapshot
-constexpr uint64 QREWARDS_REGISTRY_SIZE        = uint64(QREWARDS_MAX_POOLS) * QREWARDS_MAX_ASSETS_PER_POOL;
-constexpr uint64 QREWARDS_BPS                  = 10000;
-constexpr uint32 QREWARDS_MAX_WEIGHT_BPS       = 1000000;        // cap weight at 100x
-constexpr uint64 QREWARDS_MAX_LIST_WEIGHT      = 1000000000000ULL; // 1e12: per-recipient list weight cap
-                                                                   // (keeps pot*weight well within uint128; ample for any pro-rata scheme)
-constexpr uint64 QREWARDS_DEFAULT_CREATE_FEE   = 5000000ULL;     // 5M QU to create a pool; protocol-owner tunable
-constexpr uint64 QREWARDS_DEFAULT_OPERATING_FEE = 25000ULL;      // 25k QU per pool per epoch (~weekly on mainnet epoch cadence); protocol-owner tunable
-// Hardwired ceilings on setPlatformParams: the platformOwner can move either fee anywhere in
-// [0, cap] -- i.e. only ever reduce it from here, never raise it -- since the cap is pinned to
-// today's default. Without this, a single owner key could set operatingFee arbitrarily high and
-// instantly starve every pool's operatingBalance platform-wide, mass-pausing (then mass-
-// deactivating) every pool at the next END_EPOCH with no recovery window.
-constexpr uint64 QREWARDS_MAX_CREATE_POOL_FEE  = QREWARDS_DEFAULT_CREATE_FEE;
-constexpr uint64 QREWARDS_MAX_OPERATING_FEE    = QREWARDS_DEFAULT_OPERATING_FEE;
+constexpr uint32 QREWARDS_MAX_POOLS               = 1024;
+constexpr uint32 QREWARDS_MAX_ASSETS_PER_POOL     = 64;
+constexpr uint32 QREWARDS_MAX_DIV_CURRENCIES      = 4;          // QU + up to 3 assets per pool
+constexpr uint32 QREWARDS_MAX_BATCH               = 16;         // assets per registerAssets call
+constexpr uint32 QREWARDS_MAX_RECIP_BATCH         = 16;         // recipients per addRecipients call (MAX_INPUT_SIZE=1024)
+constexpr uint64 QREWARDS_MAX_MEMBERS             = 524288;     // 2^19 member/recipient/exclusion entries shared by all pools
+constexpr uint64 QREWARDS_MEMBER_INDEX_SIZE       = 1048576;    // 2^20 index slots: <= 50% load keeps every lookup O(1)
+constexpr uint32 QREWARDS_MAX_MEMBERS_PER_POOL    = 16384;      // joined holders or listed recipients per pool
+constexpr uint32 QREWARDS_MAX_EXCLUSIONS_PER_POOL = 64;
+constexpr uint32 QREWARDS_NONE                    = 0xFFFFFFFF; // null slot in the member lists
+constexpr uint32 QREWARDS_PAGE                    = 256;        // page size for paginated views
+constexpr uint64 QREWARDS_REGISTRY_SIZE           = uint64(QREWARDS_MAX_POOLS) * QREWARDS_MAX_ASSETS_PER_POOL;
+constexpr uint64 QREWARDS_BPS                     = 10000;
+constexpr uint32 QREWARDS_MAX_WEIGHT_BPS          = 1000000;    // cap weight at 100x
+constexpr uint64 QREWARDS_MAX_LIST_WEIGHT         = 1000000000000ULL; // 1e12: per-recipient list weight cap
+constexpr uint64 QREWARDS_DEFAULT_CREATE_FEE      = 5000000ULL; // 5M QU to create a pool
+constexpr uint64 QREWARDS_DEFAULT_OPERATING_FEE   = 25000ULL;   // 25k QU per pool per epoch
+constexpr uint64 QREWARDS_DEFAULT_JOIN_FEE        = 10000ULL;   // per joined member / listed recipient, burned into the fee reserve
+// The platformOwner can move each fee within [min, max]. The maxima are pinned to the defaults, so
+// fees can only ever be lowered (a single owner key cannot price every pool out). The minima keep
+// pool slots and member slots from becoming free to squat.
+constexpr uint64 QREWARDS_MIN_CREATE_POOL_FEE     = 1000000ULL;
+constexpr uint64 QREWARDS_MAX_CREATE_POOL_FEE     = QREWARDS_DEFAULT_CREATE_FEE;
+constexpr uint64 QREWARDS_MAX_OPERATING_FEE       = QREWARDS_DEFAULT_OPERATING_FEE;
+constexpr uint64 QREWARDS_MIN_JOIN_FEE            = 1000ULL;
+constexpr uint64 QREWARDS_MAX_JOIN_FEE            = QREWARDS_DEFAULT_JOIN_FEE;
 
 // NFT-backed weight (QBAY integration): a pool admin can register individual QBAY NFT ids as an
-// additional weight source, combined with the fungible-asset registry in holdings mode (not
-// available in list mode, which bypasses the whole holdings/weight computation by design).
-// QBAY has no notion of "collection" on a minted NFT (confirmed by reading Qbay.h directly --
-// mint() uses collectionId only to look up fee/royalty/creator and never stores it on the NFT
-// record), so membership can't be derived from QBAY automatically; the admin curates the member
-// id list directly here, the same way QTREAT's LoadAsicPart does for its own NFT-backed rewards.
-constexpr uint32 QREWARDS_MAX_NFT_PER_POOL     = 128;        // admin-curated NFT ids per pool
-constexpr uint64 QREWARDS_NFT_REGISTRY_SIZE    = uint64(QREWARDS_MAX_POOLS) * QREWARDS_MAX_NFT_PER_POOL;
-// Re-verifying every registered NFT's current possessor via a cross-contract QBAY call, for
-// every pool, every epoch, could force a large pool's snapshot into dozens of external calls in
-// a single tick (SnapshotPool must complete within one tick -- see its own comment). Spread the
-// re-verification round-robin across N epochs instead: entry i is checked only when
-// (i + qpi.epoch()) mod N == 0, so every entry is checked exactly once every N epochs with no
-// stored cursor, and a checked entry's weight is scaled by N to keep the long-run average payout
-// identical to checking everyone every epoch -- the exact technique QTREAT already uses for its
-// own QBAY-backed dividend NFTs (QTREAT_NFT_SNAPSHOT_SPREAD_EPOCHS).
-constexpr uint32 QREWARDS_NFT_SNAPSHOT_SPREAD_EPOCHS = 8;
-constexpr uint64 QREWARDS_FEE_SHAREHOLDER_PCT  = 70;             // create/operating fee split: 70% QREWARDS shareholders
-constexpr uint64 QREWARDS_FEE_QPAYHUB_PCT      = 15;             // 15% QPAYHUB dividends address (rest burned)
-constexpr uint32 QREWARDS_MAX_MISSED_EPOCHS    = 2;              // paused this many epochs, then deactivated
-constexpr uint64 QREWARDS_DIVIDEND_FEE_PCT     = 5;              // 5% fee skimmed from every dividend deposit
-constexpr uint64 QREWARDS_DIVFEE_QPAYHUB_PCT   = 80;            // of the 5% fee: 80% QPAYHUB (QU) / QPAY wallet (token)
-constexpr uint64 QREWARDS_DIVFEE_SHAREHOLDER_PCT = 20;          // of the 5% fee: 20% QREWARDS shareholders
-constexpr uint64 QREWARDS_MAX_EXCLUSIONS       = 65536;         // (poolId,address) exclusions, shared
-constexpr uint64 QREWARDS_CONTRACT_ASSET_NAME  = 19230739006837329ULL; // packed "QREWARD" (contract shares, issuer NULL_ID)
+// additional weight source in holdings mode. QBAY has no notion of "collection" on a minted NFT,
+// so the admin curates the id list. Every registered NFT is re-checked against QBAY in every
+// cycle (no rotating schedule to game), and an NFT whose QBAY auction is still running does not
+// count (QBAY moves possession to the current top bidder while the auction is open).
+constexpr uint32 QREWARDS_MAX_NFT_PER_POOL        = 128;
+constexpr uint64 QREWARDS_NFT_REGISTRY_SIZE       = uint64(QREWARDS_MAX_POOLS) * QREWARDS_MAX_NFT_PER_POOL;
+constexpr uint32 QREWARDS_QBAY_MAX_NFT_ID         = 2097152;    // QBAY_MAX_NUMBER_NFT: larger ids alias in QBAY's array
+constexpr uint16 QREWARDS_QX_CONTRACT_INDEX       = 1;          // only QX may hand share management rights to QREWARDS
 
-// Distribution modes (state.distributionMode):
-constexpr uint8  QREWARDS_DIST_END_EPOCH       = 0; // (default) distribute every pool in one END_EPOCH tick
-constexpr uint8  QREWARDS_DIST_STREAMED        = 1; // stream one pool at a time across END_TICKs over the epoch
-// Per-pool distribution target (PoolMeta.targetMode): who the pot is split among.
-constexpr uint8  QREWARDS_TARGET_HOLDINGS      = 0; // (default) live holders of the pool's registered assets
-constexpr uint8  QREWARDS_TARGET_LIST          = 1; // an explicit admin-uploaded recipient list (pro-rata by weight)
-// Streamed-mode pacing (fixed; no setter): ~24h delay before a cycle, batch per tick.
-constexpr uint32 QREWARDS_STREAM_DELAY_TICKS   = 86400;  // ~24h at ~1 tick/s: wait this many ticks into the epoch before a cycle
-constexpr uint32 QREWARDS_STREAM_BATCH         = 256;    // work units (freezes/payouts) per END_TICK
-constexpr uint16 QREWARDS_NO_CYCLE_EPOCH       = 0xFFFF; // sentinel: no cycle has run yet
-constexpr uint8  QREWARDS_STREAM_IDLE          = 0;      // streaming sub-state: need to freeze the next pool
-constexpr uint8  QREWARDS_STREAM_PAYING        = 1;      // streaming sub-state: paying out the frozen pool
+constexpr uint64 QREWARDS_FEE_SHAREHOLDER_PCT     = 70;         // create/operating fee split: 70% QREWARDS shareholders
+constexpr uint64 QREWARDS_FEE_QPAYHUB_PCT         = 15;         // 15% QPAYHUB (rest burned)
+constexpr uint32 QREWARDS_MAX_MISSED_EPOCHS       = 2;          // paused this many epochs, then closed
+constexpr uint64 QREWARDS_DIVIDEND_FEE_PCT        = 5;          // 5% fee skimmed from every dividend deposit
+constexpr uint64 QREWARDS_DIVFEE_QPAYHUB_PCT      = 80;         // of the 5% fee: 80% QPAYHUB (QU) / QPAY wallet (token)
+constexpr uint64 QREWARDS_DIVFEE_SHAREHOLDER_PCT  = 20;         // of the 5% fee: 20% QREWARDS shareholders
+constexpr uint64 QREWARDS_CONTRACT_ASSET_NAME     = 19230739006837329ULL; // packed "QREWARD" (contract shares, issuer NULL_ID)
+
+// Pool lifecycle (PoolMeta.status).
+constexpr uint8  QREWARDS_POOL_FREE               = 0;          // slot unused / released for reuse
+constexpr uint8  QREWARDS_POOL_ACTIVE             = 1;
+constexpr uint8  QREWARDS_POOL_CLOSING            = 2;          // operating fee lapsed: pays out its pots to members, then is released
+// Per-pool distribution target (PoolMeta.targetMode), fixed once the pool has members or deposits.
+constexpr uint8  QREWARDS_TARGET_HOLDINGS         = 0;          // members are joined holders, weighted by locked holdings
+constexpr uint8  QREWARDS_TARGET_LIST             = 1;          // members are an admin-uploaded weighted wallet list
+// Member-entry status (MemberEntry.status).
+constexpr uint8  QREWARDS_ENTRY_FREE              = 0;
+constexpr uint8  QREWARDS_ENTRY_MEMBER            = 1;          // joined holder (holdings mode)
+constexpr uint8  QREWARDS_ENTRY_LISTED            = 2;          // admin-listed recipient (list mode)
+constexpr uint8  QREWARDS_ENTRY_EXCLUDED          = 3;          // barred by the admin (holdings mode)
+
+// Distribution engine (END_TICK). One cycle per epoch, after a fixed delay into the epoch.
+constexpr uint32 QREWARDS_STREAM_DELAY_TICKS      = 86400;      // ~24h at ~1 tick/s
+constexpr uint32 QREWARDS_STREAM_BATCH            = 256;        // O(1) work units per END_TICK
+constexpr uint16 QREWARDS_NO_CYCLE_EPOCH          = 0xFFFF;
+constexpr uint8  QREWARDS_PHASE_IDLE              = 0;          // pick the next pool, freeze its pots
+constexpr uint8  QREWARDS_PHASE_NFT_MEASURE       = 1;          // credit registered NFTs to their member possessors
+constexpr uint8  QREWARDS_PHASE_MEASURE           = 2;          // one member per unit: record w1, sum W, prune w1 == 0
+constexpr uint8  QREWARDS_PHASE_NFT_VERIFY        = 3;          // drop NFT weight whose possessor changed since NFT_MEASURE
+constexpr uint8  QREWARDS_PHASE_PAY               = 4;          // one member per unit: pay pot * min(w1, w2) / W
+constexpr uint8  QREWARDS_PHASE_FINISH            = 5;          // carry the remainder back into the pots
+constexpr uint8  QREWARDS_PHASE_FREE              = 6;          // closing pool: release one member entry per unit
 
 // return codes
-constexpr sint32 QREWARDS_SUCCESS            = 0;
-constexpr sint32 QREWARDS_NOT_ADMIN          = 1;
-constexpr sint32 QREWARDS_INVALID_PARAM      = 2;
-constexpr sint32 QREWARDS_REGISTRY_FULL      = 3;
-constexpr sint32 QREWARDS_ASSET_NOT_ISSUED   = 4;
-constexpr sint32 QREWARDS_INVALID_INDEX      = 5;
-constexpr sint32 QREWARDS_POOL_NOT_FOUND     = 6;
-constexpr sint32 QREWARDS_POOL_INACTIVE      = 7;
-constexpr sint32 QREWARDS_MAX_POOLS_REACHED  = 8;
-constexpr sint32 QREWARDS_INSUFFICIENT_FEE   = 9;
-constexpr sint32 QREWARDS_NOT_PLATFORM_OWNER = 10;
-constexpr sint32 QREWARDS_CURRENCIES_FULL    = 11;
-constexpr sint32 QREWARDS_TRANSFER_FAILED    = 12;
-constexpr sint32 QREWARDS_POOL_PAUSED        = 13;
+constexpr sint32 QREWARDS_SUCCESS                 = 0;
+constexpr sint32 QREWARDS_NOT_ADMIN               = 1;
+constexpr sint32 QREWARDS_INVALID_PARAM           = 2;
+constexpr sint32 QREWARDS_REGISTRY_FULL           = 3;
+constexpr sint32 QREWARDS_ASSET_NOT_ISSUED        = 4;
+constexpr sint32 QREWARDS_INVALID_INDEX           = 5;
+constexpr sint32 QREWARDS_POOL_NOT_FOUND          = 6;
+constexpr sint32 QREWARDS_POOL_INACTIVE           = 7;
+constexpr sint32 QREWARDS_MAX_POOLS_REACHED       = 8;
+constexpr sint32 QREWARDS_INSUFFICIENT_FEE        = 9;
+constexpr sint32 QREWARDS_NOT_PLATFORM_OWNER      = 10;
+constexpr sint32 QREWARDS_CURRENCIES_FULL         = 11;
+constexpr sint32 QREWARDS_TRANSFER_FAILED         = 12;
+constexpr sint32 QREWARDS_POOL_PAUSED             = 13;
+constexpr sint32 QREWARDS_NOT_MEMBER              = 14;
+constexpr sint32 QREWARDS_ALREADY_MEMBER          = 15;
+constexpr sint32 QREWARDS_POOL_FULL               = 16;
+constexpr sint32 QREWARDS_EXCLUDED                = 17;
+constexpr sint32 QREWARDS_NO_WEIGHT               = 18;
+constexpr sint32 QREWARDS_CONTRACT_NOT_ALLOWED    = 19;
+constexpr sint32 QREWARDS_WRONG_MODE              = 20;
+constexpr sint32 QREWARDS_POOL_BUSY               = 21;
 
 // log types
-constexpr uint32 QREWARDS_LOG_SUCCESS       = 0;
-constexpr uint32 QREWARDS_LOG_POOL_CREATED  = 1;
-constexpr uint32 QREWARDS_LOG_DISTRIBUTED   = 2;
-constexpr uint32 QREWARDS_LOG_DIVIDEND      = 3;
-constexpr uint32 QREWARDS_LOG_ASSET_CHANGED = 4;
+constexpr uint32 QREWARDS_LOG_SUCCESS             = 0;
+constexpr uint32 QREWARDS_LOG_POOL_CREATED        = 1;
+constexpr uint32 QREWARDS_LOG_DISTRIBUTED         = 2;
+constexpr uint32 QREWARDS_LOG_DIVIDEND            = 3;
+constexpr uint32 QREWARDS_LOG_ASSET_CHANGED       = 4;
+constexpr uint32 QREWARDS_LOG_MEMBER_JOINED       = 5;
 
 struct QREWARDS2
 {
@@ -154,13 +167,16 @@ public:
         uint8  active;     // 1 = counted, 0 = ignored
     };
 
-    // One admin-curated QBAY NFT id counted toward a pool's weight in holdings mode.
-    // weightPoints is flat (not multiplied by any concentration tier the way fungible-asset
-    // points are) -- an admin who wants rarity tiers just registers rarer ids with higher points.
+    // One admin-curated QBAY NFT id counted toward a pool's weight in holdings mode. weightPoints
+    // is flat (no concentration tier); rarer ids can simply be registered with more points.
+    // measuredSlot/measuredCycle remember which member the NFT was credited to in the current
+    // cycle so NFT_VERIFY can withdraw it if the NFT moved before payment.
     struct NFTRule
     {
-        uint32 nftId;         // QBAY global NFT id (QBAY::InfoOfNFT index)
+        uint32 nftId;         // QBAY global NFT id (< QREWARDS_QBAY_MAX_NFT_ID)
         uint32 weightPoints;  // flat weight contributed while this id is held
+        uint32 measuredSlot;
+        uint32 measuredCycle;
         uint8  active;        // 1 = counted, 0 = ignored
     };
 
@@ -175,14 +191,12 @@ public:
     };
 
     // A dividend currency for a pool. assetName==0 && issuer==NULL_ID means QU.
-    // `pot` is the accumulated-but-undistributed revenue (carried across epochs
-    // if there were no eligible holders, plus per-epoch rounding dust).
     struct DivCurrency
     {
         uint64 assetName;
         id     issuer;
-        uint64 pot;           // revenue accumulating this cycle
-        uint64 distributable; // revenue rolled over from pot and currently being paid out (streamed mode)
+        uint64 pot;           // revenue accumulating for the next cycle (plus carried remainders)
+        uint64 distributable; // revenue frozen for the cycle currently paying this pool
         uint64 lifetime;      // cumulative revenue ever deposited (stat)
         uint8  active;
     };
@@ -192,85 +206,84 @@ public:
         id     admin;
         uint64 label;             // short packed name (optional)
         uint64 operatingBalance;  // QU reserve for the per-epoch operating fee
-        uint64 lastTotalWeight;   // total weight at the last distribution (for front ends)
+        uint64 lastTotalWeight;   // total measured weight of the last completed cycle (for front ends)
         uint32 numAssets;
-        uint32 numNfts;           // admin-curated QBAY NFT ids counted toward holdings-mode weight
+        uint32 numNfts;
         uint32 missedEpochs;      // consecutive epochs the operating fee could not be paid
-        uint32 listVersion;       // bumped by clearRecipients; only entries of the current version count
-        uint32 listCount;         // live recipient-list entries for this pool (enforces QREWARDS_MAX_LIST_PER_POOL)
+        uint32 memberCount;       // MEMBER/LISTED entries
+        uint32 excludedCount;     // EXCLUDED entries
+        uint32 headSlot;          // first entry of this pool's member list (QREWARDS_NONE if empty)
+        uint32 generation;        // bumped every time the slot is (re)used by createPool
         uint8  numCurrencies;
-        uint8  active;            // 1 = pool exists (0 after deactivation)
-        uint8  paused;            // 1 = underfunded, not accruing/distributing
-        uint8  targetMode;        // 0 = by holdings (default), 1 = by explicit recipient list
+        uint8  status;            // QREWARDS_POOL_*
+        uint8  paused;            // 1 = underfunded, not distributing
+        uint8  targetMode;        // QREWARDS_TARGET_*
         Array<DivCurrency, QREWARDS_MAX_DIV_CURRENCIES> currencies;
     };
 
-    // Composite key helper (excluded set + recipient list).
+    // One entry of the shared member slab. Each pool links its entries into a doubly linked list
+    // (prev/next) so insertion and removal are O(1); free slots are chained through `next`.
+    struct MemberEntry
+    {
+        id     wallet;
+        uint64 listWeight;      // list mode: admin-set weight
+        uint64 measuredWeight;  // w1 recorded in MEASURE of cycle measureCycle
+        uint64 nftMeasured;     // NFT points credited in NFT_MEASURE of cycle nftCycle
+        uint64 nftVerified;     // nftMeasured minus NFTs that moved before payment
+        uint32 prev;
+        uint32 next;
+        uint32 measureCycle;
+        uint32 nftCycle;
+        uint16 poolId;
+        uint8  status;          // QREWARDS_ENTRY_*
+    };
+
+    // Composite key for the member index: K12(poolId, wallet).
     struct KeyProto
     {
         uint64 poolId;
         id     wallet;
     };
 
-    // One entry of a pool's explicit recipient list (used when targetMode == LIST). Keyed in the
-    // shared `recipients` map by K12(poolId, wallet); the value carries poolId/wallet/weight so the
-    // map can be filtered and enumerated by pool, and `version` lets clearRecipients invalidate a
-    // whole list in O(1) (stale-version entries are ignored and reclaimed on cleanup/overwrite).
-    struct RecipientEntry
-    {
-        id     wallet;
-        uint64 poolId;
-        uint64 weight;
-        uint32 version;
-    };
-
     struct StateData
     {
-        // Excluded (poolId,address): key = K12(poolId, address) -> 1. Excluded holders
-        // earn nothing (weight forced to 0), so they neither receive nor dilute.
-        HashMap<id, uint8, QREWARDS_MAX_EXCLUSIONS> excluded;
-        // Scratch holder->weight map, rebuilt per pool during END_EPOCH distribution.
-        HashMap<id, uint64, QREWARDS_SNAPSHOT_CAP> snapshot;
-        // Explicit recipient lists for list-mode pools: key = K12(poolId, wallet) -> RecipientEntry.
-        HashMap<id, RecipientEntry, QREWARDS_MAX_RECIPIENTS> recipients;
-        uint64 pendingDivFeeQU; // QU dividend-fee skim, flushed 80/20 at END_EPOCH
+        Array<MemberEntry, QREWARDS_MAX_MEMBERS> members;
+        HashMap<uint64, uint32, QREWARDS_MEMBER_INDEX_SIZE> memberIndex; // K12(poolId, wallet).u64._0 -> slot
+        uint32 memberHighWater;  // slots below this have been handed out at least once
+        uint32 memberFreeHead;   // released slots, chained through MemberEntry.next
+        uint32 totalEntries;
+        uint64 pendingDivFeeQU;  // QU dividend-fee skim, flushed 80/20 at END_EPOCH
         Array<PoolMeta, QREWARDS_MAX_POOLS> poolMeta;
-        Array<AssetRule, QREWARDS_REGISTRY_SIZE> registry;           // pool p asset i at p*MAX_ASSETS+i
-        Array<NFTRule, QREWARDS_NFT_REGISTRY_SIZE> nftRegistry;       // pool p NFT i at p*MAX_NFT_PER_POOL+i
-        // sourceId -> poolId: a plain QU transfer from sourceId is credited to that pool's QU currency.
-        HashMap<id, uint64, QREWARDS_MAX_FUNDERS> fundingRoute;
-        uint32 numPools;
+        Array<AssetRule, QREWARDS_REGISTRY_SIZE> registry;       // pool p asset i at p*MAX_ASSETS+i
+        Array<NFTRule, QREWARDS_NFT_REGISTRY_SIZE> nftRegistry;   // pool p NFT i at p*MAX_NFT_PER_POOL+i
+        Array<uint32, QREWARDS_MAX_POOLS> freePools;             // released pool slots, reused by createPool
+        uint32 numFreePools;
+        uint32 numPools;          // pool slots ever handed out (ids are < numPools)
         id platformOwner;
-        // Receives the 15% QPAYHUB share of CREATE/OPERATING fees AND the 80% QPAYHUB
-        // share of the 5% QU DIVIDEND fee. QPAYHUB (qubic/core PR #1015) is
-        // CONTRACT_INDEX 29, so set this to id(29, 0, 0, 0): a plain qpi.transfer there
-        // is auto-credited to QPAYHUB's feePool.
+        // Receives the 15% QPAYHUB share of create/operating fees and the 80% QPAYHUB share of the
+        // 5% QU dividend fee: the QPAYHUB contract (CONTRACT_INDEX 29), a live contract whose
+        // POST_INCOMING_TRANSFER credits plain QU to its feePool.
         id qpayhubAddress;
-        // Receives the QPAY share (80%) of the 5% TOKEN dividend fee (QPAYHUB's feePool
-        // is QU-only, so token fees go here instead). Initialized to the QPAY token
-        // dividends wallet; protocol-owner tunable.
+        // Receives the 80% leg of the 5% TOKEN dividend fee (QPAYHUB's feePool is QU-only): the
+        // QRaffle charity address, a plain wallet. Hardcoded in INITIALIZE, no setter.
         id qpayTokenDividendsAddress;
         uint64 createPoolFee;
-        uint64 operatingFee;   // per-pool per-epoch
+        uint64 operatingFee;      // per pool per epoch
+        uint64 joinFee;           // per joined member / listed recipient
 
-        // --- Streamed distribution (dormant unless distributionMode == QREWARDS_DIST_STREAMED) ---
-        uint8  distributionMode;     // 0 = END_EPOCH (default), 1 = streamed across END_TICKs
+        // --- Distribution engine ---
         uint32 streamDelayTicks;     // ticks into the epoch before a cycle may start
         uint32 streamBatchSize;      // work units per END_TICK
         uint32 epochStartTick;       // qpi.tick() captured at BEGIN_EPOCH
-        uint16 lastCycleEpoch;       // epoch in which the last cycle was started (NO_CYCLE_EPOCH = none)
-        uint8  cycleActive;          // 1 = a distribution cycle is in progress
-        uint8  streamState;          // IDLE (freeze next pool) / PAYING (pay current pool)
-        uint8  streamCurrencyStarted;// 1 = streamFrozenAmt captured for the current currency
-        uint32 streamPoolCursor;     // pool being processed this cycle
-        uint8  streamCurrencyCursor; // currency index within the current pool
-        sint64 streamPayCursor;      // snapshot element index last paid (resume via nextElementIndex)
-        // Frozen exact total weight of the current pool, stored as hi/lo (uint128 has no default
-        // constructor, so it is not used directly as a state field; reassembled where needed).
-        uint64 streamTotalWeightHi;
+        uint16 lastCycleEpoch;       // epoch in which the last cycle was started
+        uint8  cycleActive;
+        uint8  streamPhase;
+        uint32 cycleId;              // incremented per cycle; 0 never matches a live cycle
+        uint32 streamPoolCursor;     // pool being processed
+        uint32 streamMemberCursor;   // next member slot to visit in MEASURE/PAY
+        uint64 streamTotalWeightHi;  // W of the current pool, as hi/lo (uint128 has no default ctor)
         uint64 streamTotalWeightLo;
-        uint64 streamFrozenAmt;      // frozen distributable amount of the current currency
-        uint64 streamPaidSum;        // amount paid so far for the current currency
+        Array<uint64, QREWARDS_MAX_DIV_CURRENCIES> streamPaid; // paid so far per currency of the current pool
     };
 
 protected:
@@ -286,167 +299,346 @@ protected:
         return 0;
     }
 
-    // Saturating uint128 -> uint64 (for the informational lastTotalWeight field).
+    // Saturating uint128 -> uint64.
     inline static uint64 sat64(uint128 v)
     {
         return (v.high != 0) ? 0xFFFFFFFFFFFFFFFFULL : v.low;
     }
 
     // One asset's weight contribution: pts * mult * weightBps / BPS^2, computed in 128-bit
-    // and saturated to UINT64_MAX so the multiplication can never overflow 64 bits. (mult
-    // <= 20000 and weightBps <= 1e6, so pts > ~9.2e8 would otherwise wrap uint64.)
+    // and saturated to UINT64_MAX so the multiplication can never overflow 64 bits.
     inline static uint64 weightContribution(uint64 pts, uint64 mult, uint64 weightBps)
     {
         return sat64(div<uint128>(uint128(pts) * uint128(mult) * uint128(weightBps),
                                   uint128(QREWARDS_BPS * QREWARDS_BPS)));
     }
 
-    // Saturating a + b in uint64 (a holder's summed weight; capping a numerator can only
-    // under-pay, never over-draw, so this is safe).
+    // Saturating a + b in uint64 (capping a weight can only under-pay, never over-draw).
     inline static uint64 satAdd64(uint64 a, uint64 b)
     {
         return (a + b < a) ? 0xFFFFFFFFFFFFFFFFULL : a + b;
     }
 
-    // Live weight of one user in one pool: sum over the pool's active registered
-    // assets of (held/unit) x concentrationMultiplier x weightBps / BPS^2.
-    // Excluded (poolId,user) earns 0. Reads holdings straight from the ledger.
-    struct ComputeEntitlement_input { uint64 poolId; id user; };
-    struct ComputeEntitlement_output { uint64 weight; };
-    struct ComputeEntitlement_locals
+    inline static uint64 min64(uint64 a, uint64 b)
+    {
+        return (a < b) ? a : b;
+    }
+
+    // NULL_ID and every contract id -- current or future -- have their upper 192 bits zero. Such
+    // ids are never paid: a contract's POST_INCOMING_TRANSFER can abort the payer.
+    inline static bit isReservedId(id x)
+    {
+        return x.u64._1 == 0 && x.u64._2 == 0 && x.u64._3 == 0;
+    }
+
+    // Order-preserving key of a qpi.year()/month()/... date (year is 0..99 since 2000).
+    inline static uint64 dateKey(uint64 y, uint64 mo, uint64 d, uint64 h, uint64 mi, uint64 s)
+    {
+        return ((((y * 16 + mo) * 32 + d) * 32 + h) * 64 + mi) * 64 + s;
+    }
+
+    // A QBAY NFT counts only when no auction is running on it: QBAY hands possession to the
+    // current top bidder while an auction is open and never resets statusOfAuction, judging
+    // auctions by their end date instead (see QBAY::getNumberOfNFTForUser).
+    inline static bit nftSettled(uint8 statusOfAuction, uint64 endKey, uint64 nowKey)
+    {
+        return statusOfAuction == 0 || nowKey > endKey;
+    }
+
+    // Look up the entry of (poolId, wallet). `taken` is set if the index key is occupied by a
+    // different entry (a 64-bit key collision): such a wallet cannot be added to that pool.
+    struct FindEntry_input { uint64 poolId; id wallet; };
+    struct FindEntry_output { uint32 slot; uint64 key; uint8 status; bit taken; };
+    struct FindEntry_locals { KeyProto proto; id hash; uint32 found; MemberEntry e; };
+    PRIVATE_FUNCTION_WITH_LOCALS(FindEntry)
+    {
+        output.slot = QREWARDS_NONE;
+        output.status = QREWARDS_ENTRY_FREE;
+        output.taken = 0;
+        setMemory(locals.proto, 0);
+        locals.proto.poolId = input.poolId;
+        locals.proto.wallet = input.wallet;
+        locals.hash = qpi.K12(locals.proto);
+        output.key = locals.hash.u64._0;
+        if (state.get().memberIndex.get(output.key, locals.found))
+        {
+            locals.e = state.get().members.get(locals.found);
+            if (locals.e.status != QREWARDS_ENTRY_FREE && (uint64)locals.e.poolId == input.poolId && locals.e.wallet == input.wallet)
+            {
+                output.slot = locals.found;
+                output.status = locals.e.status;
+            }
+            else
+            {
+                output.taken = 1;
+            }
+        }
+    }
+
+    // Locked asset weight of `wallet` in a pool: sum over the pool's active registered assets of
+    // (held/unit) x concentrationMultiplier x weightBps / BPS^2, where `held` is the wallet's
+    // shares managed by QREWARDS (locked). Shares under any other management do not count: they
+    // could move between members mid-cycle. O(numAssets) <= O(QREWARDS_MAX_ASSETS_PER_POOL) lookups.
+    struct ComputeAssetWeight_input { uint64 poolId; id wallet; };
+    struct ComputeAssetWeight_output { uint64 weight; };
+    struct ComputeAssetWeight_locals
     {
         PoolMeta meta;
-        KeyProto proto;
-        id exKey;
-        uint8 exFlag;
         uint32 i;
         uint64 base;
         AssetRule rule;
-        Asset asset;
         sint64 held;
         uint64 pts;
-        uint64 mult;
-        uint64 add;
-        uint64 nftBase;
-        NFTRule nftRule;
-        QBAY::getInfoOfNFTById_input qbayIn;
-        QBAY::getInfoOfNFTById_output qbayOut;
     };
-    PRIVATE_FUNCTION_WITH_LOCALS(ComputeEntitlement)
+    PRIVATE_FUNCTION_WITH_LOCALS(ComputeAssetWeight)
     {
         output.weight = 0;
-        setMemory(locals.proto, 0);
-        locals.proto.poolId = input.poolId;
-        locals.proto.wallet = input.user;
-        locals.exKey = qpi.K12(locals.proto);
-        locals.exFlag = 0;
-        if (state.get().excluded.get(locals.exKey, locals.exFlag) && locals.exFlag)
-        {
-            return;
-        }
         locals.meta = state.get().poolMeta.get(input.poolId);
         locals.base = input.poolId * (uint64)QREWARDS_MAX_ASSETS_PER_POOL;
         for (locals.i = 0; locals.i < locals.meta.numAssets; locals.i++)
         {
             locals.rule = state.get().registry.get(locals.base + locals.i);
             if (!locals.rule.active || locals.rule.unit == 0) continue;
-            locals.asset.assetName = locals.rule.assetName;
-            locals.asset.issuer = locals.rule.issuer;
-            locals.held = qpi.numberOfShares(locals.asset,
-                AssetOwnershipSelect::byOwner(input.user),
-                AssetPossessionSelect::byPossessor(input.user));
+            locals.held = qpi.numberOfPossessedShares(locals.rule.assetName, locals.rule.issuer,
+                input.wallet, input.wallet, SELF_INDEX, SELF_INDEX);
             if (locals.held <= 0) continue;
             locals.pts = div((uint64)locals.held, locals.rule.unit);
             if (locals.pts == 0) continue;
-            locals.mult = concentrationMultiplier(locals.pts);
-            locals.add = weightContribution(locals.pts, locals.mult, (uint64)locals.rule.weightBps);
-            output.weight = satAdd64(output.weight, locals.add);
-        }
-
-        // NFT-backed weight: bounded by this pool's own numNfts (<= QREWARDS_MAX_NFT_PER_POOL),
-        // so checking every entry live (no round-robin spread) is fine for a single-user,
-        // read-only query -- the spread exists only to bound SnapshotPool's bulk per-tick cost.
-        locals.nftBase = input.poolId * (uint64)QREWARDS_MAX_NFT_PER_POOL;
-        for (locals.i = 0; locals.i < locals.meta.numNfts; locals.i++)
-        {
-            locals.nftRule = state.get().nftRegistry.get(locals.nftBase + locals.i);
-            if (!locals.nftRule.active) continue;
-            locals.qbayIn.NFTId = locals.nftRule.nftId;
-            CALL_OTHER_CONTRACT_FUNCTION(QBAY, getInfoOfNFTById, locals.qbayIn, locals.qbayOut);
-            if (interContractCallError != NoCallError) continue;
-            if (locals.qbayOut.possessor != input.user) continue;
-            output.weight = satAdd64(output.weight, locals.nftRule.weightPoints);
+            output.weight = satAdd64(output.weight,
+                weightContribution(locals.pts, concentrationMultiplier(locals.pts), (uint64)locals.rule.weightBps));
         }
     }
 
-    // Split a QU fee (create/operating): 70% to QREWARDS shareholders, 15% to the
-    // QPAYHUB address, 15% burned. (No QPAYHUB address -> its share is burned too.)
+    // Live NFT weight of `wallet` in a pool: points of registered NFTs it possesses with no
+    // running auction. O(numNfts) <= O(QREWARDS_MAX_NFT_PER_POOL) QBAY lookups. Used by join and
+    // previewWeight; the engine credits NFTs per pool in NFT_MEASURE instead.
+    struct ComputeNftWeight_input { uint64 poolId; id wallet; };
+    struct ComputeNftWeight_output { uint64 weight; };
+    struct ComputeNftWeight_locals
+    {
+        PoolMeta meta;
+        uint32 i;
+        uint64 base;
+        uint64 nowKey;
+        NFTRule rule;
+        QBAY::getInfoOfNFTById_input qbayIn;
+        QBAY::getInfoOfNFTById_output qbayOut;
+    };
+    PRIVATE_FUNCTION_WITH_LOCALS(ComputeNftWeight)
+    {
+        output.weight = 0;
+        locals.meta = state.get().poolMeta.get(input.poolId);
+        if (locals.meta.numNfts == 0) return;
+        locals.nowKey = dateKey(qpi.year(), qpi.month(), qpi.day(), qpi.hour(), qpi.minute(), qpi.second());
+        locals.base = input.poolId * (uint64)QREWARDS_MAX_NFT_PER_POOL;
+        for (locals.i = 0; locals.i < locals.meta.numNfts; locals.i++)
+        {
+            locals.rule = state.get().nftRegistry.get(locals.base + locals.i);
+            if (!locals.rule.active) continue;
+            locals.qbayIn.NFTId = locals.rule.nftId;
+            CALL_OTHER_CONTRACT_FUNCTION(QBAY, getInfoOfNFTById, locals.qbayIn, locals.qbayOut);
+            if (interContractCallError != NoCallError) continue;
+            if (locals.qbayOut.possessor != input.wallet) continue;
+            if (!nftSettled(locals.qbayOut.statusOfAuction,
+                    dateKey(locals.qbayOut.yearAuctionEnded, locals.qbayOut.monthAuctionEnded, locals.qbayOut.dayAuctionEnded,
+                            locals.qbayOut.hourAuctionEnded, locals.qbayOut.minuteAuctionEnded, locals.qbayOut.secondAuctionEnded),
+                    locals.nowKey)) continue;
+            output.weight = satAdd64(output.weight, (uint64)locals.rule.weightPoints);
+        }
+    }
+
+    // Insert an entry for (poolId, wallet) at the head of the pool's member list. O(1). Fails
+    // (slot = NONE) if the index key is already present or the shared slab is full. Callers that
+    // hold a PoolMeta copy must re-read it afterwards (counts and headSlot change here).
+    struct AddEntry_input { uint64 poolId; id wallet; uint8 status; uint64 listWeight; uint64 key; };
+    struct AddEntry_output { uint32 slot; };
+    struct AddEntry_locals { PoolMeta meta; MemberEntry e; MemberEntry n; uint32 slot; };
+    PRIVATE_PROCEDURE_WITH_LOCALS(AddEntry)
+    {
+        output.slot = QREWARDS_NONE;
+        if (state.get().memberIndex.contains(input.key)) return;
+        if (state.get().memberFreeHead != QREWARDS_NONE)
+        {
+            locals.slot = state.get().memberFreeHead;
+            state.mut().memberFreeHead = state.get().members.get(locals.slot).next;
+        }
+        else if (state.get().memberHighWater < QREWARDS_MAX_MEMBERS)
+        {
+            locals.slot = state.get().memberHighWater;
+            state.mut().memberHighWater = state.get().memberHighWater + 1;
+        }
+        else
+        {
+            return;
+        }
+        if (state.mut().memberIndex.set(input.key, locals.slot) == NULL_INDEX)
+        {
+            // Cannot happen below 100% index load; give the slot back to the free list.
+            setMemory(locals.e, 0);
+            locals.e.next = state.get().memberFreeHead;
+            state.mut().members.set(locals.slot, locals.e);
+            state.mut().memberFreeHead = locals.slot;
+            return;
+        }
+
+        locals.meta = state.get().poolMeta.get(input.poolId);
+        setMemory(locals.e, 0);
+        locals.e.wallet = input.wallet;
+        locals.e.poolId = (uint16)input.poolId;
+        locals.e.status = input.status;
+        locals.e.listWeight = input.listWeight;
+        locals.e.prev = QREWARDS_NONE;
+        locals.e.next = locals.meta.headSlot;
+        if (locals.meta.headSlot != QREWARDS_NONE)
+        {
+            locals.n = state.get().members.get(locals.meta.headSlot);
+            locals.n.prev = locals.slot;
+            state.mut().members.set(locals.meta.headSlot, locals.n);
+        }
+        state.mut().members.set(locals.slot, locals.e);
+        locals.meta.headSlot = locals.slot;
+        if (input.status == QREWARDS_ENTRY_EXCLUDED) locals.meta.excludedCount++;
+        else locals.meta.memberCount++;
+        state.mut().poolMeta.set(input.poolId, locals.meta);
+        state.mut().totalEntries = state.get().totalEntries + 1;
+        output.slot = locals.slot;
+    }
+
+    // Unlink and release an entry. O(1). If the distribution engine's cursor points at it, the
+    // cursor advances to the next entry, so removals between or during engine steps are safe.
+    struct RemoveEntry_input { uint32 slot; };
+    struct RemoveEntry_output { };
+    struct RemoveEntry_locals { PoolMeta meta; MemberEntry e; MemberEntry n; KeyProto proto; id hash; };
+    PRIVATE_PROCEDURE_WITH_LOCALS(RemoveEntry)
+    {
+        locals.e = state.get().members.get(input.slot);
+        if (locals.e.status == QREWARDS_ENTRY_FREE) return;
+        locals.meta = state.get().poolMeta.get(locals.e.poolId);
+        if (locals.e.prev != QREWARDS_NONE)
+        {
+            locals.n = state.get().members.get(locals.e.prev);
+            locals.n.next = locals.e.next;
+            state.mut().members.set(locals.e.prev, locals.n);
+        }
+        else
+        {
+            locals.meta.headSlot = locals.e.next;
+        }
+        if (locals.e.next != QREWARDS_NONE)
+        {
+            locals.n = state.get().members.get(locals.e.next);
+            locals.n.prev = locals.e.prev;
+            state.mut().members.set(locals.e.next, locals.n);
+        }
+        if (locals.e.status == QREWARDS_ENTRY_EXCLUDED)
+        {
+            if (locals.meta.excludedCount > 0) locals.meta.excludedCount--;
+        }
+        else if (locals.meta.memberCount > 0)
+        {
+            locals.meta.memberCount--;
+        }
+        state.mut().poolMeta.set(locals.e.poolId, locals.meta);
+
+        if (state.get().cycleActive && state.get().streamPoolCursor == (uint32)locals.e.poolId
+            && state.get().streamMemberCursor == input.slot)
+        {
+            state.mut().streamMemberCursor = locals.e.next;
+        }
+
+        setMemory(locals.proto, 0);
+        locals.proto.poolId = locals.e.poolId;
+        locals.proto.wallet = locals.e.wallet;
+        locals.hash = qpi.K12(locals.proto);
+        state.mut().memberIndex.removeByKey(locals.hash.u64._0);
+
+        setMemory(locals.e, 0);
+        locals.e.next = state.get().memberFreeHead;
+        state.mut().members.set(input.slot, locals.e);
+        state.mut().memberFreeHead = input.slot;
+        if (state.get().totalEntries > 0) state.mut().totalEntries = state.get().totalEntries - 1;
+    }
+
+    // Pay `amount` QU pro-rata to QREWARDS shareholders, skipping contract possessors (paying a
+    // contract runs its POST_INCOMING_TRANSFER, which can abort this contract). Replaces
+    // qpi.distributeDividends, which pays every possessor including contracts. Bounded by the 676
+    // contract shares. `paid` is what actually left the contract; the caller handles the rest.
+    struct PayShareholdersQU_input { uint64 amount; };
+    struct PayShareholdersQU_output { uint64 paid; };
+    struct PayShareholdersQU_locals { Asset shareAsset; AssetPossessionIterator iter; uint64 perShare; sint64 held; uint64 send; };
+    PRIVATE_PROCEDURE_WITH_LOCALS(PayShareholdersQU)
+    {
+        output.paid = 0;
+        locals.perShare = div(input.amount, (uint64)NUMBER_OF_COMPUTORS);
+        if (locals.perShare == 0) return;
+        locals.shareAsset.assetName = QREWARDS_CONTRACT_ASSET_NAME;
+        locals.shareAsset.issuer = NULL_ID;
+        locals.iter.begin(locals.shareAsset);
+        while (!locals.iter.reachedEnd())
+        {
+            locals.held = locals.iter.numberOfPossessedShares();
+            if (locals.held > 0 && !isReservedId(locals.iter.possessor()))
+            {
+                locals.send = locals.perShare * (uint64)locals.held;
+                if (qpi.transfer(locals.iter.possessor(), (sint64)locals.send) >= 0)
+                {
+                    output.paid += locals.send;
+                }
+            }
+            locals.iter.next();
+        }
+    }
+
+    // Split a QU fee (create/operating): 70% to QREWARDS shareholders, 15% to QPAYHUB, the rest
+    // (15% + rounding + shares held by contracts) burned into this contract's fee reserve.
     struct DistributeFee_input { uint64 amount; };
     struct DistributeFee_output { };
-    struct DistributeFee_locals { uint64 shTotal; uint64 qpayhub; uint64 perShare; uint64 actualSh; uint64 burnAmt; };
+    struct DistributeFee_locals { PayShareholdersQU_input psi; PayShareholdersQU_output pso; uint64 qpayhub; uint64 burnAmt; };
     PRIVATE_PROCEDURE_WITH_LOCALS(DistributeFee)
     {
         if (input.amount == 0) return;
-        locals.shTotal = div(input.amount * QREWARDS_FEE_SHAREHOLDER_PCT, 100ULL);
+        locals.psi.amount = div(input.amount * QREWARDS_FEE_SHAREHOLDER_PCT, 100ULL);
+        CALL(PayShareholdersQU, locals.psi, locals.pso);
         locals.qpayhub = div(input.amount * QREWARDS_FEE_QPAYHUB_PCT, 100ULL);
-        locals.perShare = div(locals.shTotal, (uint64)NUMBER_OF_COMPUTORS);
-        locals.actualSh = locals.perShare * (uint64)NUMBER_OF_COMPUTORS;
-        if (locals.perShare > 0)
-        {
-            qpi.distributeDividends((sint64)locals.perShare);
-        }
         if (locals.qpayhub > 0)
         {
-            if (state.get().qpayhubAddress != NULL_ID)
+            if (state.get().qpayhubAddress == NULL_ID
+                || qpi.transfer(state.get().qpayhubAddress, (sint64)locals.qpayhub) < 0)
             {
-                qpi.transfer(state.get().qpayhubAddress, (sint64)locals.qpayhub);
-            }
-            else
-            {
-                locals.qpayhub = 0; // no address set -> burn this share instead
+                locals.qpayhub = 0; // not sent -> burned with the rest
             }
         }
-        locals.burnAmt = input.amount - locals.actualSh - locals.qpayhub;
+        locals.burnAmt = input.amount - locals.pso.paid - locals.qpayhub;
         if (locals.burnAmt > 0)
         {
             qpi.burn((sint64)locals.burnAmt);
         }
     }
 
-    // Split a QU dividend fee: 20% to QREWARDS shareholders, 80% (+ rounding) to the
-    // QPAYHUB dividends account (auto-credited QU transfer). Burned if unset.
+    // Split a QU dividend fee: 20% to QREWARDS shareholders, the rest (80% + rounding + shares
+    // held by contracts) to QPAYHUB. Burned if QPAYHUB cannot be paid.
     struct DistributeDivFee_input { uint64 amount; };
     struct DistributeDivFee_output { };
-    struct DistributeDivFee_locals { uint64 shTotal; uint64 perShare; uint64 actualSh; uint64 toQpayhub; };
+    struct DistributeDivFee_locals { PayShareholdersQU_input psi; PayShareholdersQU_output pso; uint64 toQpayhub; };
     PRIVATE_PROCEDURE_WITH_LOCALS(DistributeDivFee)
     {
         if (input.amount == 0) return;
-        locals.shTotal = div(input.amount * QREWARDS_DIVFEE_SHAREHOLDER_PCT, 100ULL);
-        locals.perShare = div(locals.shTotal, (uint64)NUMBER_OF_COMPUTORS);
-        locals.actualSh = locals.perShare * (uint64)NUMBER_OF_COMPUTORS;
-        if (locals.perShare > 0)
-        {
-            qpi.distributeDividends((sint64)locals.perShare);
-        }
-        locals.toQpayhub = input.amount - locals.actualSh;
+        locals.psi.amount = div(input.amount * QREWARDS_DIVFEE_SHAREHOLDER_PCT, 100ULL);
+        CALL(PayShareholdersQU, locals.psi, locals.pso);
+        locals.toQpayhub = input.amount - locals.pso.paid;
         if (locals.toQpayhub > 0)
         {
-            if (state.get().qpayhubAddress != NULL_ID)
-            {
-                qpi.transfer(state.get().qpayhubAddress, (sint64)locals.toQpayhub);
-            }
-            else
+            if (state.get().qpayhubAddress == NULL_ID
+                || qpi.transfer(state.get().qpayhubAddress, (sint64)locals.toQpayhub) < 0)
             {
                 qpi.burn((sint64)locals.toQpayhub);
             }
         }
     }
 
-    // Distribute an asset (token) held by SELF pro-rata to QREWARDS shareholders.
-    // distributeDividends() is QU-only, so for the 20% shareholder leg of a *token*
-    // dividend fee we iterate the contract share asset and transfer per-share.
-    // `distributed` is the amount actually sent out (<= amount; dust/failed transfers
-    // stay with SELF and are folded back by the caller to the QPAY wallet).
+    // Distribute an asset (token) held by SELF pro-rata to QREWARDS shareholders, skipping
+    // contract possessors (they could never move QREWARDS-managed shares). `distributed` is the
+    // amount actually sent out; the caller folds the rest to the QPAY wallet.
     struct DistributeTokenToShareholders_input { uint64 assetName; id issuer; uint64 amount; };
     struct DistributeTokenToShareholders_output { uint64 distributed; };
     struct DistributeTokenToShareholders_locals { Asset shareAsset; AssetPossessionIterator iter; uint64 perShare; sint64 held; uint64 send; };
@@ -462,7 +654,7 @@ protected:
         while (!locals.iter.reachedEnd())
         {
             locals.held = locals.iter.numberOfPossessedShares();
-            if (locals.held > 0)
+            if (locals.held > 0 && !isReservedId(locals.iter.possessor()))
             {
                 locals.send = locals.perShare * (uint64)locals.held;
                 if (qpi.transferShareOwnershipAndPossession(input.assetName, input.issuer,
@@ -475,351 +667,341 @@ protected:
         }
     }
 
-    // Build the live holder -> weight snapshot for a pool into state.snapshot, and return
-    // the total weight. Reads holdings straight from the asset ledger; must run within one
-    // tick (the ledger iterator cannot be resumed across ticks). Excluded addresses and SELF
-    // are skipped. Shared by END_EPOCH distribution and the streamed engine's freeze step.
-    struct SnapshotPool_input { uint64 poolId; };
-    struct SnapshotPool_output { uint128 totalWeight; }; // exact sum of stored per-holder weights
-    struct SnapshotPool_locals
+    // One O(1) unit of the distribution engine (see the phase constants). END_TICK calls this at
+    // most streamBatchSize times per tick. A unit is: skipping/freezing one pool, one member
+    // (<= MAX_ASSETS_PER_POOL lookups, <= MAX_DIV_CURRENCIES transfers), one pass over a pool's NFT
+    // registry (<= MAX_NFT_PER_POOL QBAY lookups), finishing a pool, or releasing one entry.
+    struct StreamStep_input { };
+    struct StreamStep_output { };
+    struct StreamStep_locals
     {
         PoolMeta meta;
-        uint64 base;
+        MemberEntry e;
+        NFTRule rule;
+        DivCurrency cur;
+        uint32 pool;
+        uint32 slot;
+        uint32 k;
         uint32 i;
-        AssetRule rule;
-        Asset asset;
-        AssetPossessionIterator iter;
-        id holder;
-        sint64 held;
-        KeyProto proto;
-        id exKey;
-        uint8 exFlag;
-        uint64 pts;
-        uint64 mult;
-        uint64 add;
-        uint64 existing;
-        uint64 stored;
-        sint64 ridx;
-        RecipientEntry rentry;
         uint64 nftBase;
-        NFTRule nftRule;
+        uint64 w;
+        uint64 eff;
+        uint64 amt;
+        uint64 carry;
+        uint64 nowKey;
+        bit anyFunds;
+        bit holdsNft;
+        uint128 totalWeight;
+        ComputeAssetWeight_input cawi;
+        ComputeAssetWeight_output cawo;
+        FindEntry_input fei;
+        FindEntry_output feo;
+        RemoveEntry_input rei;
+        RemoveEntry_output reo;
         QBAY::getInfoOfNFTById_input qbayIn;
         QBAY::getInfoOfNFTById_output qbayOut;
-        uint64 nftAdd;
     };
-    PRIVATE_PROCEDURE_WITH_LOCALS(SnapshotPool)
+    PRIVATE_PROCEDURE_WITH_LOCALS(StreamStep)
     {
-        output.totalWeight = 0;
-        state.mut().snapshot.reset();
-        locals.meta = state.get().poolMeta.get(input.poolId);
+        locals.pool = state.get().streamPoolCursor;
 
-        // LIST mode: the "snapshot" is the admin's explicit recipient list (current version,
-        // weight > 0), not the live ledger. Each wallet appears once (deduped by key).
-        if (locals.meta.targetMode == QREWARDS_TARGET_LIST)
+        if (state.get().streamPhase == QREWARDS_PHASE_IDLE)
         {
-            for (locals.ridx = state.get().recipients.nextElementIndex(NULL_INDEX);
-                 locals.ridx != NULL_INDEX;
-                 locals.ridx = state.get().recipients.nextElementIndex(locals.ridx))
-            {
-                locals.rentry = state.get().recipients.value(locals.ridx);
-                if (locals.rentry.poolId != input.poolId) continue;
-                if (locals.rentry.version != locals.meta.listVersion) continue;
-                if (locals.rentry.weight == 0) continue;
-                if (state.mut().snapshot.set(locals.rentry.wallet, locals.rentry.weight) != NULL_INDEX)
-                    output.totalWeight = output.totalWeight + (uint128)locals.rentry.weight;
-            }
-            return;
-        }
-
-        locals.base = input.poolId * (uint64)QREWARDS_MAX_ASSETS_PER_POOL;
-        for (locals.i = 0; locals.i < locals.meta.numAssets; locals.i++)
-        {
-            locals.rule = state.get().registry.get(locals.base + locals.i);
-            if (!locals.rule.active || locals.rule.unit == 0) continue;
-            locals.asset.assetName = locals.rule.assetName;
-            locals.asset.issuer = locals.rule.issuer;
-            locals.iter.begin(locals.asset);
-            while (!locals.iter.reachedEnd())
-            {
-                locals.held = locals.iter.numberOfPossessedShares();
-                locals.holder = locals.iter.possessor();
-                if (locals.held > 0 && locals.holder != SELF)
-                {
-                    setMemory(locals.proto, 0);
-                    locals.proto.poolId = input.poolId;
-                    locals.proto.wallet = locals.holder;
-                    locals.exKey = qpi.K12(locals.proto);
-                    locals.exFlag = 0;
-                    if (!(state.get().excluded.get(locals.exKey, locals.exFlag) && locals.exFlag))
-                    {
-                        locals.pts = div((uint64)locals.held, locals.rule.unit);
-                        if (locals.pts > 0)
-                        {
-                            locals.mult = concentrationMultiplier(locals.pts);
-                            locals.add = weightContribution(locals.pts, locals.mult, (uint64)locals.rule.weightBps);
-                            if (locals.add > 0)
-                            {
-                                locals.existing = 0;
-                                state.get().snapshot.get(locals.holder, locals.existing);
-                                locals.stored = satAdd64(locals.existing, locals.add); // per-holder cap
-                                // Only count the weight if it is actually stored (an existing key
-                                // updates in place; a new key is dropped iff the map is full).
-                                if (state.mut().snapshot.set(locals.holder, locals.stored) != NULL_INDEX)
-                                {
-                                    // totalWeight is the EXACT uint128 sum of stored per-holder
-                                    // weights, so sum(payouts) can never exceed the pot.
-                                    output.totalWeight = output.totalWeight + (uint128)(locals.stored - locals.existing);
-                                }
-                            }
-                        }
-                    }
-                }
-                locals.iter.next();
-            }
-        }
-
-        // NFT-backed weight: round-robin spread across QREWARDS_NFT_SNAPSHOT_SPREAD_EPOCHS
-        // epochs (see the constant's comment) instead of re-verifying every registered id's
-        // live possessor via a cross-contract QBAY call every single epoch. Entry i is only
-        // checked when (i + qpi.epoch()) mod N == 0; a checked entry's weight is scaled by N
-        // to keep the long-run average payout identical to checking everyone every epoch.
-        locals.nftBase = input.poolId * (uint64)QREWARDS_MAX_NFT_PER_POOL;
-        for (locals.i = 0; locals.i < locals.meta.numNfts; locals.i++)
-        {
-            if (mod((uint64)locals.i + qpi.epoch(), (uint64)QREWARDS_NFT_SNAPSHOT_SPREAD_EPOCHS) != 0) continue;
-            locals.nftRule = state.get().nftRegistry.get(locals.nftBase + locals.i);
-            if (!locals.nftRule.active) continue;
-            locals.qbayIn.NFTId = locals.nftRule.nftId;
-            CALL_OTHER_CONTRACT_FUNCTION(QBAY, getInfoOfNFTById, locals.qbayIn, locals.qbayOut);
-            if (interContractCallError != NoCallError) continue;
-            if (locals.qbayOut.possessor == NULL_ID || locals.qbayOut.possessor == SELF) continue;
-
-            setMemory(locals.proto, 0);
-            locals.proto.poolId = input.poolId;
-            locals.proto.wallet = locals.qbayOut.possessor;
-            locals.exKey = qpi.K12(locals.proto);
-            locals.exFlag = 0;
-            if (state.get().excluded.get(locals.exKey, locals.exFlag) && locals.exFlag) continue;
-
-            locals.nftAdd = (uint64)locals.nftRule.weightPoints * QREWARDS_NFT_SNAPSHOT_SPREAD_EPOCHS;
-            locals.existing = 0;
-            state.get().snapshot.get(locals.qbayOut.possessor, locals.existing);
-            locals.stored = satAdd64(locals.existing, locals.nftAdd);
-            if (state.mut().snapshot.set(locals.qbayOut.possessor, locals.stored) != NULL_INDEX)
-            {
-                output.totalWeight = output.totalWeight + (uint128)(locals.stored - locals.existing);
-            }
-        }
-    }
-
-    // END_EPOCH distribution (distributionMode == QREWARDS_DIST_END_EPOCH): snapshot the pool
-    // and pay every currency's pot pro-rata by weight, all in this tick. Rounding dust stays
-    // in pot and carries. Fine for a handful of pools; use streamed mode to scale out.
-    struct DistributePool_input { uint64 poolId; };
-    struct DistributePool_output { };
-    struct DistributePool_locals
-    {
-        PoolMeta meta;
-        SnapshotPool_input spi;
-        SnapshotPool_output spo;
-        uint128 totalWeight;
-        uint32 k;
-        DivCurrency cur;
-        sint64 idx;
-        id holder;
-        uint64 weight;
-        uint64 payout;
-        uint64 distributed;
-        uint64 frozen;
-        uint128 prod;
-        uint128 pay128;
-    };
-    PRIVATE_PROCEDURE_WITH_LOCALS(DistributePool)
-    {
-        locals.meta = state.get().poolMeta.get(input.poolId);
-        // (A list-mode pool may have no registered assets, so don't skip on numAssets==0;
-        //  an empty snapshot just yields totalWeight 0 and carries the pot.)
-        if (!locals.meta.active || locals.meta.paused) return;
-
-        locals.spi.poolId = input.poolId;
-        CALL(SnapshotPool, locals.spi, locals.spo);
-        locals.totalWeight = locals.spo.totalWeight;
-
-        locals.meta.lastTotalWeight = sat64(locals.totalWeight);
-        if (!locals.totalWeight) // == 0
-        {
-            state.mut().poolMeta.set(input.poolId, locals.meta); // no eligible holders: pots carry
-            return;
-        }
-
-        for (locals.k = 0; locals.k < locals.meta.numCurrencies; locals.k++)
-        {
-            locals.cur = locals.meta.currencies.get(locals.k);
-            // Fold in any `distributable` too: it is normally 0 in END_EPOCH mode, but if the owner
-            // switched streamed -> END_EPOCH mid-cycle, a pool may have amounts already rolled from
-            // pot into distributable; draining both here prevents those funds from being stranded.
-            if (locals.cur.pot == 0 && locals.cur.distributable == 0) continue;
-            // Checks-effects-interactions: freeze the amount and persist pot = 0 BEFORE paying, so
-            // the stored state never shows funds that are mid-transfer. Payouts are computed from the
-            // frozen amount; the undistributed remainder (rounding dust + any failed sends) is
-            // returned to the pot after the loop. (Mirrors the streamed engine's roll-then-pay.)
-            locals.frozen = locals.cur.pot + locals.cur.distributable;
-            locals.cur.pot = 0;
-            locals.cur.distributable = 0;
-            locals.meta.currencies.set(locals.k, locals.cur);
-            state.mut().poolMeta.set(input.poolId, locals.meta);
-
-            locals.distributed = 0;
-            for (locals.idx = state.get().snapshot.nextElementIndex(NULL_INDEX);
-                 locals.idx != NULL_INDEX;
-                 locals.idx = state.get().snapshot.nextElementIndex(locals.idx))
-            {
-                locals.holder = state.get().snapshot.key(locals.idx);
-                locals.weight = state.get().snapshot.value(locals.idx);
-                if (locals.weight == 0) continue;
-                locals.prod = (uint128)locals.frozen * (uint128)locals.weight;
-                locals.pay128 = div<uint128>(locals.prod, locals.totalWeight);
-                locals.payout = locals.pay128.low; // <= frozen, fits uint64
-                if (locals.payout == 0) continue;
-                if (locals.cur.assetName == 0 && locals.cur.issuer == NULL_ID)
-                {
-                    if (qpi.transfer(locals.holder, (sint64)locals.payout) >= 0)
-                        locals.distributed += locals.payout;
-                }
-                else
-                {
-                    if (qpi.transferShareOwnershipAndPossession(locals.cur.assetName, locals.cur.issuer,
-                            SELF, SELF, (sint64)locals.payout, locals.holder) >= 0)
-                        locals.distributed += locals.payout;
-                }
-            }
-            locals.cur.pot = locals.frozen - locals.distributed; // carry rounding dust / failed sends
-            locals.meta.currencies.set(locals.k, locals.cur);
-            state.mut().poolMeta.set(input.poolId, locals.meta);
-        }
-        state.mut().poolMeta.set(input.poolId, locals.meta);
-    }
-
-    // Streamed distribution (distributionMode == QREWARDS_DIST_STREAMED): advance one
-    // distribution cycle by up to `streamBatchSize` work units, called from END_TICK. A cycle
-    // walks pools in order; for each pool it rolls pot->distributable and freezes the holder
-    // snapshot in one work unit, then pays the frozen amounts out over subsequent work units.
-    // Cursors live in state, so a cycle resumes exactly across ticks and even across epoch
-    // boundaries (it is never reset mid-cycle), which makes it idempotent: no holder is paid
-    // twice and no funds are lost (undistributed amounts stay in pot/distributable and carry).
-    struct StreamDistribute_input { };
-    struct StreamDistribute_output { };
-    struct StreamDistribute_locals
-    {
-        uint32 budget;
-        PoolMeta meta;
-        SnapshotPool_input spi;
-        SnapshotPool_output spo;
-        uint32 k;
-        DivCurrency cur;
-        sint64 idx;
-        id holder;
-        uint64 weight;
-        uint64 payout;
-        uint128 prod;
-        uint128 pay128;
-    };
-    PRIVATE_PROCEDURE_WITH_LOCALS(StreamDistribute)
-    {
-        locals.budget = state.get().streamBatchSize;
-        while (locals.budget > 0)
-        {
-            locals.budget--;
-            if (state.get().streamPoolCursor >= state.get().numPools)
+            if (locals.pool >= state.get().numPools)
             {
                 state.mut().cycleActive = 0; // cycle complete
                 return;
             }
+            locals.meta = state.get().poolMeta.get(locals.pool);
+            if (locals.meta.status == QREWARDS_POOL_FREE
+                || (locals.meta.status == QREWARDS_POOL_ACTIVE && locals.meta.paused))
+            {
+                state.mut().streamPoolCursor = locals.pool + 1;
+                return;
+            }
+            locals.anyFunds = 0;
+            for (locals.k = 0; locals.k < locals.meta.numCurrencies; locals.k++)
+            {
+                locals.cur = locals.meta.currencies.get(locals.k);
+                if (locals.cur.pot > 0 || locals.cur.distributable > 0) locals.anyFunds = 1;
+            }
+            if (locals.meta.status == QREWARDS_POOL_CLOSING && !locals.anyFunds)
+            {
+                state.mut().streamPhase = QREWARDS_PHASE_FREE;
+                return;
+            }
+            if (!locals.anyFunds || locals.meta.memberCount == 0)
+            {
+                state.mut().streamPoolCursor = locals.pool + 1; // nothing to pay / nobody to pay
+                return;
+            }
+            // Freeze the pots for this cycle; later deposits accumulate in pot for the next one.
+            for (locals.k = 0; locals.k < locals.meta.numCurrencies; locals.k++)
+            {
+                locals.cur = locals.meta.currencies.get(locals.k);
+                locals.cur.distributable += locals.cur.pot;
+                locals.cur.pot = 0;
+                locals.meta.currencies.set(locals.k, locals.cur);
+                state.mut().streamPaid.set(locals.k, 0);
+            }
+            state.mut().poolMeta.set(locals.pool, locals.meta);
+            state.mut().streamTotalWeightHi = 0;
+            state.mut().streamTotalWeightLo = 0;
+            // Members inserted after this point land before the cursor and are not measured
+            // this cycle, so joining mid-cycle cannot capture an already frozen pot.
+            state.mut().streamMemberCursor = locals.meta.headSlot;
+            state.mut().streamPhase = (locals.meta.targetMode == QREWARDS_TARGET_HOLDINGS && locals.meta.numNfts > 0)
+                ? QREWARDS_PHASE_NFT_MEASURE : QREWARDS_PHASE_MEASURE;
+            return;
+        }
 
-            if (state.get().streamState == QREWARDS_STREAM_IDLE)
-            {
-                // Start a pool: roll pot -> distributable, then freeze its snapshot (one unit).
-                // (A list-mode pool may have no registered assets; don't skip on numAssets==0.)
-                locals.meta = state.get().poolMeta.get(state.get().streamPoolCursor);
-                if (!locals.meta.active || locals.meta.paused)
-                {
-                    state.mut().streamPoolCursor = state.get().streamPoolCursor + 1;
-                    continue;
-                }
-                for (locals.k = 0; locals.k < locals.meta.numCurrencies; locals.k++)
-                {
-                    locals.cur = locals.meta.currencies.get(locals.k);
-                    locals.cur.distributable += locals.cur.pot;
-                    locals.cur.pot = 0;
-                    locals.meta.currencies.set(locals.k, locals.cur);
-                }
-                locals.spi.poolId = state.get().streamPoolCursor;
-                CALL(SnapshotPool, locals.spi, locals.spo);
-                locals.meta.lastTotalWeight = sat64(locals.spo.totalWeight);
-                state.mut().poolMeta.set(state.get().streamPoolCursor, locals.meta);
-                state.mut().streamTotalWeightHi = locals.spo.totalWeight.high;
-                state.mut().streamTotalWeightLo = locals.spo.totalWeight.low;
-                state.mut().streamState = QREWARDS_STREAM_PAYING;
-                state.mut().streamCurrencyCursor = 0;
-                state.mut().streamCurrencyStarted = 0;
-                state.mut().streamPayCursor = NULL_INDEX;
-                continue;
-            }
+        locals.meta = state.get().poolMeta.get(locals.pool);
+        locals.nftBase = (uint64)locals.pool * (uint64)QREWARDS_MAX_NFT_PER_POOL;
 
-            // PAYING
-            locals.meta = state.get().poolMeta.get(state.get().streamPoolCursor);
-            if (state.get().streamCurrencyCursor >= locals.meta.numCurrencies
-                || (state.get().streamTotalWeightHi == 0 && state.get().streamTotalWeightLo == 0))
+        if (state.get().streamPhase == QREWARDS_PHASE_NFT_MEASURE)
+        {
+            locals.nowKey = dateKey(qpi.year(), qpi.month(), qpi.day(), qpi.hour(), qpi.minute(), qpi.second());
+            for (locals.i = 0; locals.i < locals.meta.numNfts; locals.i++)
             {
-                state.mut().streamPoolCursor = state.get().streamPoolCursor + 1;
-                state.mut().streamState = QREWARDS_STREAM_IDLE;
-                continue;
-            }
-            locals.cur = locals.meta.currencies.get(state.get().streamCurrencyCursor);
-            if (!state.get().streamCurrencyStarted)
-            {
-                state.mut().streamFrozenAmt = locals.cur.distributable;
-                state.mut().streamPaidSum = 0;
-                state.mut().streamPayCursor = NULL_INDEX;
-                state.mut().streamCurrencyStarted = 1;
-                if (locals.cur.distributable == 0)
+                locals.rule = state.get().nftRegistry.get(locals.nftBase + locals.i);
+                locals.rule.measuredCycle = 0;
+                if (locals.rule.active)
                 {
-                    // nothing to pay in this currency; advance
-                    state.mut().streamCurrencyCursor = state.get().streamCurrencyCursor + 1;
-                    state.mut().streamCurrencyStarted = 0;
+                    locals.qbayIn.NFTId = locals.rule.nftId;
+                    CALL_OTHER_CONTRACT_FUNCTION(QBAY, getInfoOfNFTById, locals.qbayIn, locals.qbayOut);
+                    if (interContractCallError == NoCallError && locals.qbayOut.possessor != NULL_ID
+                        && nftSettled(locals.qbayOut.statusOfAuction,
+                               dateKey(locals.qbayOut.yearAuctionEnded, locals.qbayOut.monthAuctionEnded, locals.qbayOut.dayAuctionEnded,
+                                       locals.qbayOut.hourAuctionEnded, locals.qbayOut.minuteAuctionEnded, locals.qbayOut.secondAuctionEnded),
+                               locals.nowKey))
+                    {
+                        locals.fei.poolId = locals.pool;
+                        locals.fei.wallet = locals.qbayOut.possessor;
+                        CALL(FindEntry, locals.fei, locals.feo);
+                        if (locals.feo.slot != QREWARDS_NONE && locals.feo.status == QREWARDS_ENTRY_MEMBER)
+                        {
+                            locals.e = state.get().members.get(locals.feo.slot);
+                            if (locals.e.nftCycle != state.get().cycleId)
+                            {
+                                locals.e.nftMeasured = 0;
+                                locals.e.nftVerified = 0;
+                                locals.e.nftCycle = state.get().cycleId;
+                            }
+                            locals.e.nftMeasured = satAdd64(locals.e.nftMeasured, (uint64)locals.rule.weightPoints);
+                            locals.e.nftVerified = satAdd64(locals.e.nftVerified, (uint64)locals.rule.weightPoints);
+                            state.mut().members.set(locals.feo.slot, locals.e);
+                            locals.rule.measuredSlot = locals.feo.slot;
+                            locals.rule.measuredCycle = state.get().cycleId;
+                        }
+                    }
                 }
-                continue;
+                state.mut().nftRegistry.set(locals.nftBase + locals.i, locals.rule);
             }
-            locals.idx = state.get().snapshot.nextElementIndex(state.get().streamPayCursor);
-            if (locals.idx == NULL_INDEX)
+            state.mut().streamPhase = QREWARDS_PHASE_MEASURE;
+            return;
+        }
+
+        if (state.get().streamPhase == QREWARDS_PHASE_MEASURE)
+        {
+            locals.slot = state.get().streamMemberCursor;
+            if (locals.slot == QREWARDS_NONE)
             {
-                // currency done: carry the undistributed dust, advance to next currency
-                locals.cur.distributable = state.get().streamFrozenAmt - state.get().streamPaidSum;
-                locals.meta.currencies.set(state.get().streamCurrencyCursor, locals.cur);
-                state.mut().poolMeta.set(state.get().streamPoolCursor, locals.meta);
-                state.mut().streamCurrencyCursor = state.get().streamCurrencyCursor + 1;
-                state.mut().streamCurrencyStarted = 0;
-                continue;
+                state.mut().streamMemberCursor = locals.meta.headSlot;
+                state.mut().streamPhase = (locals.meta.targetMode == QREWARDS_TARGET_HOLDINGS && locals.meta.numNfts > 0)
+                    ? QREWARDS_PHASE_NFT_VERIFY : QREWARDS_PHASE_PAY;
+                return;
             }
-            locals.holder = state.get().snapshot.key(locals.idx);
-            locals.weight = state.get().snapshot.value(locals.idx);
-            state.mut().streamPayCursor = locals.idx;
-            if (locals.weight == 0) continue;
-            locals.prod = (uint128)state.get().streamFrozenAmt * (uint128)locals.weight;
-            locals.pay128 = div<uint128>(locals.prod, uint128(state.get().streamTotalWeightHi, state.get().streamTotalWeightLo));
-            locals.payout = locals.pay128.low;
-            if (locals.payout == 0) continue;
-            if (locals.cur.assetName == 0 && locals.cur.issuer == NULL_ID)
+            locals.e = state.get().members.get(locals.slot);
+            locals.w = 0;
+            if (locals.e.status == QREWARDS_ENTRY_MEMBER)
             {
-                if (qpi.transfer(locals.holder, (sint64)locals.payout) >= 0)
-                    state.mut().streamPaidSum = state.get().streamPaidSum + locals.payout;
+                locals.cawi.poolId = locals.pool;
+                locals.cawi.wallet = locals.e.wallet;
+                CALL(ComputeAssetWeight, locals.cawi, locals.cawo);
+                locals.w = locals.cawo.weight;
+                if (locals.e.nftCycle == state.get().cycleId) locals.w = satAdd64(locals.w, locals.e.nftMeasured);
+                if (locals.w == 0)
+                {
+                    // Holds nothing that counts any more: prune (frees the slot, advances the cursor).
+                    locals.rei.slot = locals.slot;
+                    CALL(RemoveEntry, locals.rei, locals.reo);
+                    return;
+                }
+            }
+            else if (locals.e.status == QREWARDS_ENTRY_LISTED)
+            {
+                locals.w = locals.e.listWeight;
+            }
+            if (locals.w > 0)
+            {
+                locals.e.measuredWeight = locals.w;
+                locals.e.measureCycle = state.get().cycleId;
+                state.mut().members.set(locals.slot, locals.e);
+                locals.totalWeight = uint128(state.get().streamTotalWeightHi, state.get().streamTotalWeightLo) + uint128(locals.w);
+                state.mut().streamTotalWeightHi = locals.totalWeight.high;
+                state.mut().streamTotalWeightLo = locals.totalWeight.low;
+            }
+            state.mut().streamMemberCursor = locals.e.next;
+            return;
+        }
+
+        if (state.get().streamPhase == QREWARDS_PHASE_NFT_VERIFY)
+        {
+            locals.nowKey = dateKey(qpi.year(), qpi.month(), qpi.day(), qpi.hour(), qpi.minute(), qpi.second());
+            for (locals.i = 0; locals.i < locals.meta.numNfts; locals.i++)
+            {
+                locals.rule = state.get().nftRegistry.get(locals.nftBase + locals.i);
+                if (locals.rule.measuredCycle != state.get().cycleId) continue;
+                locals.e = state.get().members.get(locals.rule.measuredSlot);
+                // A slot freed and reused since NFT_MEASURE has nftCycle 0 and is left alone.
+                if (locals.e.status != QREWARDS_ENTRY_MEMBER || (uint32)locals.e.poolId != locals.pool
+                    || locals.e.nftCycle != state.get().cycleId) continue;
+                locals.qbayIn.NFTId = locals.rule.nftId;
+                CALL_OTHER_CONTRACT_FUNCTION(QBAY, getInfoOfNFTById, locals.qbayIn, locals.qbayOut);
+                locals.holdsNft = (interContractCallError == NoCallError && locals.qbayOut.possessor == locals.e.wallet
+                    && nftSettled(locals.qbayOut.statusOfAuction,
+                           dateKey(locals.qbayOut.yearAuctionEnded, locals.qbayOut.monthAuctionEnded, locals.qbayOut.dayAuctionEnded,
+                                   locals.qbayOut.hourAuctionEnded, locals.qbayOut.minuteAuctionEnded, locals.qbayOut.secondAuctionEnded),
+                           locals.nowKey));
+                if (!locals.holdsNft)
+                {
+                    locals.e.nftVerified = (locals.e.nftVerified > (uint64)locals.rule.weightPoints)
+                        ? locals.e.nftVerified - (uint64)locals.rule.weightPoints : 0;
+                    state.mut().members.set(locals.rule.measuredSlot, locals.e);
+                }
+            }
+            state.mut().streamMemberCursor = locals.meta.headSlot;
+            state.mut().streamPhase = QREWARDS_PHASE_PAY;
+            return;
+        }
+
+        if (state.get().streamPhase == QREWARDS_PHASE_PAY)
+        {
+            locals.slot = state.get().streamMemberCursor;
+            if (locals.slot == QREWARDS_NONE)
+            {
+                state.mut().streamPhase = QREWARDS_PHASE_FINISH;
+                return;
+            }
+            locals.e = state.get().members.get(locals.slot);
+            state.mut().streamMemberCursor = locals.e.next;
+            if (locals.e.measureCycle != state.get().cycleId) return; // joined after MEASURE
+            if (isReservedId(locals.e.wallet)) return;                  // never pay contracts
+            if (locals.e.status == QREWARDS_ENTRY_MEMBER)
+            {
+                locals.cawi.poolId = locals.pool;
+                locals.cawi.wallet = locals.e.wallet;
+                CALL(ComputeAssetWeight, locals.cawi, locals.cawo);
+                locals.w = locals.cawo.weight;
+                if (locals.e.nftCycle == state.get().cycleId) locals.w = satAdd64(locals.w, locals.e.nftVerified);
+            }
+            else if (locals.e.status == QREWARDS_ENTRY_LISTED)
+            {
+                locals.w = locals.e.listWeight;
             }
             else
             {
-                if (qpi.transferShareOwnershipAndPossession(locals.cur.assetName, locals.cur.issuer,
-                        SELF, SELF, (sint64)locals.payout, locals.holder) >= 0)
-                    state.mut().streamPaidSum = state.get().streamPaidSum + locals.payout;
+                return; // excluded since MEASURE
             }
+            locals.eff = min64(locals.e.measuredWeight, locals.w);
+            if (locals.eff == 0) return;
+            locals.totalWeight = uint128(state.get().streamTotalWeightHi, state.get().streamTotalWeightLo);
+            if (!locals.totalWeight) return;
+            for (locals.k = 0; locals.k < locals.meta.numCurrencies; locals.k++)
+            {
+                locals.cur = locals.meta.currencies.get(locals.k);
+                if (locals.cur.distributable == 0) continue;
+                // eff <= w1 and sum(w1) == W, so this never exceeds distributable; the clamp to the
+                // unpaid remainder keeps the pot solvent even so.
+                locals.amt = div<uint128>(uint128(locals.cur.distributable) * uint128(locals.eff), locals.totalWeight).low;
+                locals.amt = min64(locals.amt, locals.cur.distributable - state.get().streamPaid.get(locals.k));
+                if (locals.amt == 0) continue;
+                if (locals.cur.assetName == 0 && locals.cur.issuer == NULL_ID)
+                {
+                    if (qpi.transfer(locals.e.wallet, (sint64)locals.amt) >= 0)
+                        state.mut().streamPaid.set(locals.k, state.get().streamPaid.get(locals.k) + locals.amt);
+                }
+                else
+                {
+                    if (qpi.transferShareOwnershipAndPossession(locals.cur.assetName, locals.cur.issuer,
+                            SELF, SELF, (sint64)locals.amt, locals.e.wallet) >= 0)
+                        state.mut().streamPaid.set(locals.k, state.get().streamPaid.get(locals.k) + locals.amt);
+                }
+            }
+            return;
+        }
+
+        if (state.get().streamPhase == QREWARDS_PHASE_FINISH)
+        {
+            locals.totalWeight = uint128(state.get().streamTotalWeightHi, state.get().streamTotalWeightLo);
+            locals.anyFunds = 0;
+            for (locals.k = 0; locals.k < locals.meta.numCurrencies; locals.k++)
+            {
+                locals.cur = locals.meta.currencies.get(locals.k);
+                locals.carry = locals.cur.distributable - state.get().streamPaid.get(locals.k);
+                locals.cur.distributable = 0;
+                // A closing pool's final cycle paid its members; whatever is left (rounding dust and
+                // the share of members whose weight fell mid-cycle) is burned / sent to the QPAY wallet
+                // rather than carried forever. Without any measured weight, it waits for members.
+                if (locals.meta.status == QREWARDS_POOL_CLOSING && locals.totalWeight && locals.carry > 0)
+                {
+                    if (locals.cur.assetName == 0 && locals.cur.issuer == NULL_ID)
+                    {
+                        if (qpi.burn((sint64)locals.carry) >= 0) locals.carry = 0;
+                    }
+                    else if (qpi.transferShareOwnershipAndPossession(locals.cur.assetName, locals.cur.issuer,
+                                 SELF, SELF, (sint64)locals.carry, state.get().qpayTokenDividendsAddress) >= 0)
+                    {
+                        locals.carry = 0;
+                    }
+                }
+                locals.cur.pot += locals.carry;
+                if (locals.cur.pot > 0) locals.anyFunds = 1;
+                locals.meta.currencies.set(locals.k, locals.cur);
+            }
+            locals.meta.lastTotalWeight = sat64(locals.totalWeight);
+            state.mut().poolMeta.set(locals.pool, locals.meta);
+            if (locals.meta.status == QREWARDS_POOL_CLOSING && !locals.anyFunds)
+            {
+                state.mut().streamPhase = QREWARDS_PHASE_FREE;
+                return;
+            }
+            state.mut().streamPhase = QREWARDS_PHASE_IDLE;
+            state.mut().streamPoolCursor = locals.pool + 1;
+            return;
+        }
+
+        if (state.get().streamPhase == QREWARDS_PHASE_FREE)
+        {
+            if (locals.meta.headSlot != QREWARDS_NONE)
+            {
+                locals.rei.slot = locals.meta.headSlot;
+                CALL(RemoveEntry, locals.rei, locals.reo);
+                return;
+            }
+            // All entries released: refund the operating balance to the admin and free the slot.
+            if (locals.meta.operatingBalance > 0)
+            {
+                if (isReservedId(locals.meta.admin))
+                    qpi.burn((sint64)locals.meta.operatingBalance);
+                else
+                    qpi.transfer(locals.meta.admin, (sint64)locals.meta.operatingBalance);
+            }
+            locals.meta.operatingBalance = 0;
+            locals.meta.status = QREWARDS_POOL_FREE;
+            locals.meta.paused = 0;
+            locals.meta.numAssets = 0;
+            locals.meta.numNfts = 0;
+            locals.meta.numCurrencies = 0;
+            locals.meta.memberCount = 0;
+            locals.meta.excludedCount = 0;
+            locals.meta.headSlot = QREWARDS_NONE;
+            state.mut().poolMeta.set(locals.pool, locals.meta);
+            state.mut().freePools.set(state.get().numFreePools, locals.pool);
+            state.mut().numFreePools = state.get().numFreePools + 1;
+            state.mut().streamPhase = QREWARDS_PHASE_IDLE;
+            state.mut().streamPoolCursor = locals.pool + 1;
+            return;
         }
     }
 
@@ -828,24 +1010,60 @@ public:
     /********PROCEDURES (state-changing)***/
     /**************************************/
 
-    struct createPool_input { uint64 label; };
+    // Create a pool. The invocation reward must cover createPoolFee (split 70/15/15); any excess
+    // seeds the pool's operating balance. targetMode is chosen here, atomically with creation, so
+    // a pool can never be switched to list mode under its depositors. Released pool slots are
+    // reused (generation is bumped). Contracts cannot create pools.
+    struct createPool_input { uint64 label; uint8 targetMode; };
     struct createPool_output { sint32 returnCode; uint64 poolId; };
-    struct createPool_locals { PoolMeta meta; DivCurrency qu; DistributeFee_input dfi; DistributeFee_output dfo; QRewardsLogger log; };
+    struct createPool_locals
+    {
+        PoolMeta meta;
+        DivCurrency qu;
+        DistributeFee_input dfi;
+        DistributeFee_output dfo;
+        uint32 slot;
+        uint32 generation;
+        QRewardsLogger log;
+    };
     PUBLIC_PROCEDURE_WITH_LOCALS(createPool)
     {
+        if (isReservedId(qpi.invocator()))
+        {
+            if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            output.returnCode = QREWARDS_CONTRACT_NOT_ALLOWED;
+            return;
+        }
         if ((uint64)qpi.invocationReward() < state.get().createPoolFee)
         {
             if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
             output.returnCode = QREWARDS_INSUFFICIENT_FEE;
             return;
         }
-        if (state.get().numPools >= QREWARDS_MAX_POOLS)
+        if (input.targetMode != QREWARDS_TARGET_HOLDINGS && input.targetMode != QREWARDS_TARGET_LIST)
         {
-            if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            output.returnCode = QREWARDS_INVALID_PARAM;
+            return;
+        }
+        if (state.get().numFreePools > 0)
+        {
+            state.mut().numFreePools = state.get().numFreePools - 1;
+            locals.slot = state.get().freePools.get(state.get().numFreePools);
+        }
+        else if (state.get().numPools < QREWARDS_MAX_POOLS)
+        {
+            locals.slot = state.get().numPools;
+            state.mut().numPools = state.get().numPools + 1;
+        }
+        else
+        {
+            qpi.transfer(qpi.invocator(), qpi.invocationReward());
             output.returnCode = QREWARDS_MAX_POOLS_REACHED;
             return;
         }
-        // 70/15/15 split of the create fee; any excess seeds the pool's operating balance.
+        locals.generation = state.get().poolMeta.get(locals.slot).generation + 1;
+
         locals.dfi.amount = state.get().createPoolFee;
         CALL(DistributeFee, locals.dfi, locals.dfo);
 
@@ -853,21 +1071,18 @@ public:
         locals.meta.admin = qpi.invocator();
         locals.meta.label = input.label;
         locals.meta.operatingBalance = (uint64)qpi.invocationReward() - state.get().createPoolFee;
-        locals.meta.active = 1;
-        locals.meta.paused = 0;
-        locals.meta.missedEpochs = 0;
-        // currency slot 0 = QU by default
+        locals.meta.status = QREWARDS_POOL_ACTIVE;
+        locals.meta.targetMode = input.targetMode;
+        locals.meta.headSlot = QREWARDS_NONE;
+        locals.meta.generation = locals.generation;
+        // currency slot 0 = QU
         setMemory(locals.qu, 0);
-        locals.qu.assetName = 0;
-        locals.qu.issuer = NULL_ID;
         locals.qu.active = 1;
         locals.meta.currencies.set(0, locals.qu);
         locals.meta.numCurrencies = 1;
+        state.mut().poolMeta.set(locals.slot, locals.meta);
 
-        output.poolId = state.get().numPools;
-        state.mut().poolMeta.set(output.poolId, locals.meta);
-        state.mut().numPools = state.get().numPools + 1;
-
+        output.poolId = locals.slot;
         output.returnCode = QREWARDS_SUCCESS;
         locals.log = QRewardsLogger{ CONTRACT_INDEX, QREWARDS_LOG_POOL_CREATED, 0 };
         LOG_INFO(locals.log);
@@ -875,18 +1090,28 @@ public:
 
     struct addDividendCurrency_input { uint64 poolId; uint64 assetName; id issuer; };
     struct addDividendCurrency_output { sint32 returnCode; uint32 currencyIndex; };
-    struct addDividendCurrency_locals { PoolMeta meta; DivCurrency cur; };
+    struct addDividendCurrency_locals { PoolMeta meta; DivCurrency cur; uint32 k; };
     PUBLIC_PROCEDURE_WITH_LOCALS(addDividendCurrency)
     {
         if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
         if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
         locals.meta = state.get().poolMeta.get(input.poolId);
+        if (locals.meta.status != QREWARDS_POOL_ACTIVE) { output.returnCode = QREWARDS_POOL_INACTIVE; return; }
         if (qpi.invocator() != locals.meta.admin) { output.returnCode = QREWARDS_NOT_ADMIN; return; }
         if (locals.meta.numCurrencies >= QREWARDS_MAX_DIV_CURRENCIES) { output.returnCode = QREWARDS_CURRENCIES_FULL; return; }
         if (input.assetName == 0 || !qpi.isAssetIssued(input.issuer, input.assetName))
         {
             output.returnCode = QREWARDS_ASSET_NOT_ISSUED;
             return;
+        }
+        for (locals.k = 0; locals.k < locals.meta.numCurrencies; locals.k++)
+        {
+            locals.cur = locals.meta.currencies.get(locals.k);
+            if (locals.cur.assetName == input.assetName && locals.cur.issuer == input.issuer)
+            {
+                output.returnCode = QREWARDS_INVALID_PARAM; // already a currency of this pool
+                return;
+            }
         }
         setMemory(locals.cur, 0);
         locals.cur.assetName = input.assetName;
@@ -899,20 +1124,28 @@ public:
         output.returnCode = QREWARDS_SUCCESS;
     }
 
+    // Register a qualifying asset. The same asset cannot be registered twice in a pool.
     struct registerAsset_input { uint64 poolId; uint64 assetName; id issuer; uint64 unit; uint32 weightBps; uint8 kind; };
     struct registerAsset_output { sint32 returnCode; uint32 index; };
-    struct registerAsset_locals { PoolMeta meta; AssetRule rule; QRewardsLogger log; };
+    struct registerAsset_locals { PoolMeta meta; AssetRule rule; uint64 base; uint32 i; QRewardsLogger log; };
     PUBLIC_PROCEDURE_WITH_LOCALS(registerAsset)
     {
         if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
         if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
         locals.meta = state.get().poolMeta.get(input.poolId);
-        if (!locals.meta.active) { output.returnCode = QREWARDS_POOL_INACTIVE; return; }
+        if (locals.meta.status != QREWARDS_POOL_ACTIVE) { output.returnCode = QREWARDS_POOL_INACTIVE; return; }
         if (qpi.invocator() != locals.meta.admin) { output.returnCode = QREWARDS_NOT_ADMIN; return; }
         if (input.unit == 0 || input.weightBps == 0 || input.weightBps > QREWARDS_MAX_WEIGHT_BPS)
         { output.returnCode = QREWARDS_INVALID_PARAM; return; }
         if (locals.meta.numAssets >= QREWARDS_MAX_ASSETS_PER_POOL) { output.returnCode = QREWARDS_REGISTRY_FULL; return; }
         if (!qpi.isAssetIssued(input.issuer, input.assetName)) { output.returnCode = QREWARDS_ASSET_NOT_ISSUED; return; }
+        locals.base = input.poolId * (uint64)QREWARDS_MAX_ASSETS_PER_POOL;
+        for (locals.i = 0; locals.i < locals.meta.numAssets; locals.i++)
+        {
+            locals.rule = state.get().registry.get(locals.base + locals.i);
+            if (locals.rule.assetName == input.assetName && locals.rule.issuer == input.issuer)
+            { output.returnCode = QREWARDS_INVALID_PARAM; return; } // duplicate
+        }
 
         locals.rule.assetName = input.assetName;
         locals.rule.issuer = input.issuer;
@@ -920,7 +1153,7 @@ public:
         locals.rule.weightBps = input.weightBps;
         locals.rule.kind = input.kind;
         locals.rule.active = 1;
-        state.mut().registry.set(input.poolId * (uint64)QREWARDS_MAX_ASSETS_PER_POOL + locals.meta.numAssets, locals.rule);
+        state.mut().registry.set(locals.base + locals.meta.numAssets, locals.rule);
         output.index = locals.meta.numAssets;
         locals.meta.numAssets++;
         state.mut().poolMeta.set(input.poolId, locals.meta);
@@ -929,20 +1162,21 @@ public:
         LOG_INFO(locals.log);
     }
 
-    // Batch register up to QREWARDS_MAX_BATCH assets at once. Invalid specs are
+    // Batch register up to QREWARDS_MAX_BATCH assets at once. Invalid or duplicate specs are
     // skipped; output.added reports how many were registered.
     struct registerAssets_input { uint64 poolId; uint32 count; Array<AssetSpec, QREWARDS_MAX_BATCH> specs; };
     struct registerAssets_output { sint32 returnCode; uint32 added; };
-    struct registerAssets_locals { PoolMeta meta; AssetSpec spec; AssetRule rule; uint32 i; uint32 n; };
+    struct registerAssets_locals { PoolMeta meta; AssetSpec spec; AssetRule rule; uint64 base; uint32 i; uint32 j; uint32 n; bit duplicate; };
     PUBLIC_PROCEDURE_WITH_LOCALS(registerAssets)
     {
         if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
         output.added = 0;
         if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
         locals.meta = state.get().poolMeta.get(input.poolId);
-        if (!locals.meta.active) { output.returnCode = QREWARDS_POOL_INACTIVE; return; }
+        if (locals.meta.status != QREWARDS_POOL_ACTIVE) { output.returnCode = QREWARDS_POOL_INACTIVE; return; }
         if (qpi.invocator() != locals.meta.admin) { output.returnCode = QREWARDS_NOT_ADMIN; return; }
 
+        locals.base = input.poolId * (uint64)QREWARDS_MAX_ASSETS_PER_POOL;
         locals.n = (input.count > QREWARDS_MAX_BATCH) ? QREWARDS_MAX_BATCH : input.count;
         for (locals.i = 0; locals.i < locals.n; locals.i++)
         {
@@ -950,25 +1184,51 @@ public:
             locals.spec = input.specs.get(locals.i);
             if (locals.spec.unit == 0 || locals.spec.weightBps == 0 || locals.spec.weightBps > QREWARDS_MAX_WEIGHT_BPS) continue;
             if (!qpi.isAssetIssued(locals.spec.issuer, locals.spec.assetName)) continue;
+            locals.duplicate = 0;
+            for (locals.j = 0; locals.j < locals.meta.numAssets; locals.j++)
+            {
+                locals.rule = state.get().registry.get(locals.base + locals.j);
+                if (locals.rule.assetName == locals.spec.assetName && locals.rule.issuer == locals.spec.issuer) locals.duplicate = 1;
+            }
+            if (locals.duplicate) continue;
             locals.rule.assetName = locals.spec.assetName;
             locals.rule.issuer = locals.spec.issuer;
             locals.rule.unit = locals.spec.unit;
             locals.rule.weightBps = locals.spec.weightBps;
             locals.rule.kind = locals.spec.kind;
             locals.rule.active = 1;
-            state.mut().registry.set(input.poolId * (uint64)QREWARDS_MAX_ASSETS_PER_POOL + locals.meta.numAssets, locals.rule);
+            state.mut().registry.set(locals.base + locals.meta.numAssets, locals.rule);
             locals.meta.numAssets++;
             output.added++;
+        }
+        if (output.added > 0) state.mut().poolMeta.set(input.poolId, locals.meta);
+        output.returnCode = QREWARDS_SUCCESS;
+    }
+
+    // Remove a registered asset (swap-remove, so registry slots are reused).
+    struct removeAsset_input { uint64 poolId; uint32 index; };
+    struct removeAsset_output { sint32 returnCode; };
+    struct removeAsset_locals { PoolMeta meta; uint64 base; };
+    PUBLIC_PROCEDURE_WITH_LOCALS(removeAsset)
+    {
+        if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+        if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
+        locals.meta = state.get().poolMeta.get(input.poolId);
+        if (locals.meta.status != QREWARDS_POOL_ACTIVE) { output.returnCode = QREWARDS_POOL_INACTIVE; return; }
+        if (qpi.invocator() != locals.meta.admin) { output.returnCode = QREWARDS_NOT_ADMIN; return; }
+        if (input.index >= locals.meta.numAssets) { output.returnCode = QREWARDS_INVALID_INDEX; return; }
+        locals.base = input.poolId * (uint64)QREWARDS_MAX_ASSETS_PER_POOL;
+        locals.meta.numAssets--;
+        if (input.index != locals.meta.numAssets)
+        {
+            state.mut().registry.set(locals.base + input.index, state.get().registry.get(locals.base + locals.meta.numAssets));
         }
         state.mut().poolMeta.set(input.poolId, locals.meta);
         output.returnCode = QREWARDS_SUCCESS;
     }
 
-    // Admin-curated NFT-backed weight (QBAY integration, holdings mode only -- see the
-    // QREWARDS_MAX_NFT_PER_POOL comment for why QBAY can't tell QREWARDS which NFTs belong
-    // together on its own). Registering confirms the id is a real, currently-possessed QBAY NFT
-    // (catches admin typos early) but does NOT lock in the possessor -- ComputeEntitlement and
-    // SnapshotPool both re-check the live possessor every time weight is computed.
+    // Register a QBAY NFT id as a weight source (holdings mode). The id must be below QBAY's NFT
+    // capacity (larger ids alias in QBAY's array), not already registered, and currently minted.
     struct registerNFT_input { uint64 poolId; uint32 nftId; uint32 weightPoints; };
     struct registerNFT_output { sint32 returnCode; uint32 index; };
     struct registerNFT_locals
@@ -981,9 +1241,9 @@ public:
         if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
         if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
         locals.meta = state.get().poolMeta.get(input.poolId);
-        if (!locals.meta.active) { output.returnCode = QREWARDS_POOL_INACTIVE; return; }
+        if (locals.meta.status != QREWARDS_POOL_ACTIVE) { output.returnCode = QREWARDS_POOL_INACTIVE; return; }
         if (qpi.invocator() != locals.meta.admin) { output.returnCode = QREWARDS_NOT_ADMIN; return; }
-        if (input.weightPoints == 0) { output.returnCode = QREWARDS_INVALID_PARAM; return; }
+        if (input.weightPoints == 0 || input.nftId >= QREWARDS_QBAY_MAX_NFT_ID) { output.returnCode = QREWARDS_INVALID_PARAM; return; }
         if (locals.meta.numNfts >= QREWARDS_MAX_NFT_PER_POOL) { output.returnCode = QREWARDS_REGISTRY_FULL; return; }
 
         locals.base = input.poolId * (uint64)QREWARDS_MAX_NFT_PER_POOL;
@@ -998,6 +1258,7 @@ public:
         if (interContractCallError != NoCallError || locals.qbayOut.possessor == NULL_ID)
         { output.returnCode = QREWARDS_ASSET_NOT_ISSUED; return; }
 
+        setMemory(locals.rule, 0);
         locals.rule.nftId = input.nftId;
         locals.rule.weightPoints = input.weightPoints;
         locals.rule.active = 1;
@@ -1016,6 +1277,7 @@ public:
         if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
         if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
         locals.meta = state.get().poolMeta.get(input.poolId);
+        if (locals.meta.status != QREWARDS_POOL_ACTIVE) { output.returnCode = QREWARDS_POOL_INACTIVE; return; }
         if (qpi.invocator() != locals.meta.admin) { output.returnCode = QREWARDS_NOT_ADMIN; return; }
         if (input.index >= locals.meta.numNfts) { output.returnCode = QREWARDS_INVALID_INDEX; return; }
         if (input.weightPoints == 0) { output.returnCode = QREWARDS_INVALID_PARAM; return; }
@@ -1023,6 +1285,28 @@ public:
         locals.rule.weightPoints = input.weightPoints;
         locals.rule.active = (input.active != 0) ? 1 : 0;
         state.mut().nftRegistry.set(input.poolId * (uint64)QREWARDS_MAX_NFT_PER_POOL + input.index, locals.rule);
+        output.returnCode = QREWARDS_SUCCESS;
+    }
+
+    // Remove a registered NFT (swap-remove, so registry slots are reused).
+    struct removeNFT_input { uint64 poolId; uint32 index; };
+    struct removeNFT_output { sint32 returnCode; };
+    struct removeNFT_locals { PoolMeta meta; uint64 base; };
+    PUBLIC_PROCEDURE_WITH_LOCALS(removeNFT)
+    {
+        if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+        if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
+        locals.meta = state.get().poolMeta.get(input.poolId);
+        if (locals.meta.status != QREWARDS_POOL_ACTIVE) { output.returnCode = QREWARDS_POOL_INACTIVE; return; }
+        if (qpi.invocator() != locals.meta.admin) { output.returnCode = QREWARDS_NOT_ADMIN; return; }
+        if (input.index >= locals.meta.numNfts) { output.returnCode = QREWARDS_INVALID_INDEX; return; }
+        locals.base = input.poolId * (uint64)QREWARDS_MAX_NFT_PER_POOL;
+        locals.meta.numNfts--;
+        if (input.index != locals.meta.numNfts)
+        {
+            state.mut().nftRegistry.set(locals.base + input.index, state.get().nftRegistry.get(locals.base + locals.meta.numNfts));
+        }
+        state.mut().poolMeta.set(input.poolId, locals.meta);
         output.returnCode = QREWARDS_SUCCESS;
     }
 
@@ -1034,6 +1318,7 @@ public:
         if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
         if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
         locals.meta = state.get().poolMeta.get(input.poolId);
+        if (locals.meta.status != QREWARDS_POOL_ACTIVE) { output.returnCode = QREWARDS_POOL_INACTIVE; return; }
         if (qpi.invocator() != locals.meta.admin) { output.returnCode = QREWARDS_NOT_ADMIN; return; }
         if (input.index >= locals.meta.numAssets) { output.returnCode = QREWARDS_INVALID_INDEX; return; }
         if (input.unit == 0 || input.weightBps == 0 || input.weightBps > QREWARDS_MAX_WEIGHT_BPS)
@@ -1055,6 +1340,7 @@ public:
         if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
         if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
         locals.meta = state.get().poolMeta.get(input.poolId);
+        if (locals.meta.status != QREWARDS_POOL_ACTIVE) { output.returnCode = QREWARDS_POOL_INACTIVE; return; }
         if (qpi.invocator() != locals.meta.admin) { output.returnCode = QREWARDS_NOT_ADMIN; return; }
         if (input.index >= locals.meta.numAssets) { output.returnCode = QREWARDS_INVALID_INDEX; return; }
         if (input.weightBps == 0 || input.weightBps > QREWARDS_MAX_WEIGHT_BPS) { output.returnCode = QREWARDS_INVALID_PARAM; return; }
@@ -1064,6 +1350,8 @@ public:
         output.returnCode = QREWARDS_SUCCESS;
     }
 
+    // Hand the pool to a new admin. NULL_ID and contract ids are rejected: the admin receives the
+    // operating-balance refund when the pool closes, and contracts are never paid.
     struct setPoolAdmin_input { uint64 poolId; id newAdmin; };
     struct setPoolAdmin_output { sint32 returnCode; };
     struct setPoolAdmin_locals { PoolMeta meta; };
@@ -1072,60 +1360,103 @@ public:
         if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
         if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
         locals.meta = state.get().poolMeta.get(input.poolId);
+        if (locals.meta.status == QREWARDS_POOL_FREE) { output.returnCode = QREWARDS_POOL_INACTIVE; return; }
         if (qpi.invocator() != locals.meta.admin) { output.returnCode = QREWARDS_NOT_ADMIN; return; }
+        if (isReservedId(input.newAdmin)) { output.returnCode = QREWARDS_CONTRACT_NOT_ALLOWED; return; }
         locals.meta.admin = input.newAdmin;
         state.mut().poolMeta.set(input.poolId, locals.meta);
         output.returnCode = QREWARDS_SUCCESS;
     }
 
-    // Exclude (or re-include) an address in a pool. Excluded addresses earn nothing
-    // (weight forced to 0), so they neither receive dividends nor dilute others.
+    // Exclude (or re-include) an address in a holdings-mode pool. An excluded address cannot join;
+    // a current member is converted in place and earns nothing from then on. Capped at
+    // QREWARDS_MAX_EXCLUSIONS_PER_POOL per pool, so one pool cannot exhaust shared capacity.
     struct setExcludedAddress_input { uint64 poolId; id address; bit excluded; };
     struct setExcludedAddress_output { sint32 returnCode; };
-    struct setExcludedAddress_locals { PoolMeta meta; KeyProto proto; id key; };
+    struct setExcludedAddress_locals
+    {
+        PoolMeta meta; MemberEntry e;
+        FindEntry_input fei; FindEntry_output feo;
+        AddEntry_input aei; AddEntry_output aeo;
+        RemoveEntry_input rei; RemoveEntry_output reo;
+    };
     PUBLIC_PROCEDURE_WITH_LOCALS(setExcludedAddress)
     {
         if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
         if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
         locals.meta = state.get().poolMeta.get(input.poolId);
+        if (locals.meta.status != QREWARDS_POOL_ACTIVE) { output.returnCode = QREWARDS_POOL_INACTIVE; return; }
         if (qpi.invocator() != locals.meta.admin) { output.returnCode = QREWARDS_NOT_ADMIN; return; }
-        setMemory(locals.proto, 0);
-        locals.proto.poolId = input.poolId;
-        locals.proto.wallet = input.address;
-        locals.key = qpi.K12(locals.proto);
-        if (input.excluded) state.mut().excluded.set(locals.key, 1);
-        else state.mut().excluded.removeByKey(locals.key);
+        if (locals.meta.targetMode != QREWARDS_TARGET_HOLDINGS) { output.returnCode = QREWARDS_WRONG_MODE; return; }
+        if (isReservedId(input.address)) { output.returnCode = QREWARDS_INVALID_PARAM; return; } // can never join anyway
+
+        locals.fei.poolId = input.poolId;
+        locals.fei.wallet = input.address;
+        CALL(FindEntry, locals.fei, locals.feo);
         output.returnCode = QREWARDS_SUCCESS;
+        if (input.excluded)
+        {
+            if (locals.feo.status == QREWARDS_ENTRY_EXCLUDED) return;
+            if (locals.meta.excludedCount >= QREWARDS_MAX_EXCLUSIONS_PER_POOL) { output.returnCode = QREWARDS_REGISTRY_FULL; return; }
+            if (locals.feo.slot != QREWARDS_NONE)
+            {
+                // Current member: flip in place. Stays linked; the engine skips EXCLUDED entries.
+                locals.e = state.get().members.get(locals.feo.slot);
+                locals.e.status = QREWARDS_ENTRY_EXCLUDED;
+                state.mut().members.set(locals.feo.slot, locals.e);
+                locals.meta.memberCount--;
+                locals.meta.excludedCount++;
+                state.mut().poolMeta.set(input.poolId, locals.meta);
+                return;
+            }
+            if (locals.feo.taken) { output.returnCode = QREWARDS_REGISTRY_FULL; return; }
+            locals.aei.poolId = input.poolId;
+            locals.aei.wallet = input.address;
+            locals.aei.status = QREWARDS_ENTRY_EXCLUDED;
+            locals.aei.listWeight = 0;
+            locals.aei.key = locals.feo.key;
+            CALL(AddEntry, locals.aei, locals.aeo);
+            if (locals.aeo.slot == QREWARDS_NONE) output.returnCode = QREWARDS_REGISTRY_FULL;
+        }
+        else if (locals.feo.status == QREWARDS_ENTRY_EXCLUDED)
+        {
+            locals.rei.slot = locals.feo.slot;
+            CALL(RemoveEntry, locals.rei, locals.reo);
+        }
     }
 
-    // --- Explicit recipient-list distribution (targetMode == LIST) ---
-    // A pool admin can switch a pool to pay its dividends to an uploaded wallet list (pro-rata by
-    // weight, default equal) instead of to asset holders. The pot still accumulates from deposits
-    // and is distributed automatically each epoch by the normal engine; only the recipient set
-    // changes. The list is stored and built up in batches.
-
-    // Switch a pool between by-holdings (0, default) and by-list (1) distribution. Admin only.
+    // Change a pool's target mode. Only allowed during setup -- before the pool has ever received
+    // a deposit and while it has no entries -- so an admin can never switch a funded holdings pool
+    // to a self-serving list. (The mode can also be chosen directly in createPool.)
     struct setTargetMode_input { uint64 poolId; uint8 mode; };
     struct setTargetMode_output { sint32 returnCode; };
-    struct setTargetMode_locals { PoolMeta meta; };
+    struct setTargetMode_locals { PoolMeta meta; DivCurrency cur; uint32 k; };
     PUBLIC_PROCEDURE_WITH_LOCALS(setTargetMode)
     {
         if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
         if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
         locals.meta = state.get().poolMeta.get(input.poolId);
+        if (locals.meta.status != QREWARDS_POOL_ACTIVE) { output.returnCode = QREWARDS_POOL_INACTIVE; return; }
         if (qpi.invocator() != locals.meta.admin) { output.returnCode = QREWARDS_NOT_ADMIN; return; }
-        locals.meta.targetMode = (input.mode == QREWARDS_TARGET_LIST) ? QREWARDS_TARGET_LIST : QREWARDS_TARGET_HOLDINGS;
+        if (input.mode != QREWARDS_TARGET_HOLDINGS && input.mode != QREWARDS_TARGET_LIST) { output.returnCode = QREWARDS_INVALID_PARAM; return; }
+        if (locals.meta.memberCount > 0 || locals.meta.excludedCount > 0) { output.returnCode = QREWARDS_POOL_BUSY; return; }
+        for (locals.k = 0; locals.k < locals.meta.numCurrencies; locals.k++)
+        {
+            locals.cur = locals.meta.currencies.get(locals.k);
+            if (locals.cur.lifetime > 0 || locals.cur.pot > 0 || locals.cur.distributable > 0)
+            { output.returnCode = QREWARDS_POOL_BUSY; return; }
+        }
+        locals.meta.targetMode = input.mode;
         state.mut().poolMeta.set(input.poolId, locals.meta);
         output.returnCode = QREWARDS_SUCCESS;
     }
 
-    // Add/update (weight > 0) or remove (weight == 0) recipients in a pool's list. For an equal
-    // split, pass the same weight (e.g. 1) for every wallet. Deduped by wallet; tagged with the
-    // pool's current listVersion. Up to QREWARDS_MAX_RECIP_BATCH per call; call repeatedly for
-    // longer lists. A pool's list is hard-capped at QREWARDS_MAX_LIST_PER_POOL (5,000): once full,
-    // further NEW wallets are skipped (output.added < count), but existing entries can still be
-    // updated or removed. Since the cap is below QREWARDS_SNAPSHOT_CAP, every listed recipient is
-    // always paid in full each epoch (nobody is truncated).
+    // --- List mode: an admin-uploaded weighted wallet list instead of joined holders ---
+
+    // Add/update (weight > 0) or remove (weight == 0) recipients. Every NEW recipient costs
+    // joinFee, taken from the invocation reward (unused reward is refunded) and burned into the
+    // fee reserve, like a join. NULL_ID and contract ids are rejected. Capped per pool at
+    // QREWARDS_MAX_MEMBERS_PER_POOL.
     struct addRecipients_input
     {
         uint64 poolId;
@@ -1134,98 +1465,274 @@ public:
         Array<uint64, QREWARDS_MAX_RECIP_BATCH> weights;
     };
     struct addRecipients_output { sint32 returnCode; uint32 added; uint32 rejected; uint32 listCount; };
-    struct addRecipients_locals { PoolMeta meta; uint32 n; uint32 i; id w; uint64 wt; KeyProto proto; id key; RecipientEntry e; bit existed; };
+    struct addRecipients_locals
+    {
+        PoolMeta meta; MemberEntry e;
+        uint32 n; uint32 i; id w; uint64 wt; uint64 budget; uint64 charged;
+        FindEntry_input fei; FindEntry_output feo;
+        AddEntry_input aei; AddEntry_output aeo;
+        RemoveEntry_input rei; RemoveEntry_output reo;
+    };
     PUBLIC_PROCEDURE_WITH_LOCALS(addRecipients)
     {
-        if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
         output.added = 0;
         output.rejected = 0;
-        if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
+        output.listCount = 0;
+        if (input.poolId >= state.get().numPools)
+        {
+            if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            output.returnCode = QREWARDS_POOL_NOT_FOUND;
+            return;
+        }
         locals.meta = state.get().poolMeta.get(input.poolId);
-        if (qpi.invocator() != locals.meta.admin) { output.returnCode = QREWARDS_NOT_ADMIN; return; }
+        if (locals.meta.status != QREWARDS_POOL_ACTIVE || qpi.invocator() != locals.meta.admin
+            || locals.meta.targetMode != QREWARDS_TARGET_LIST)
+        {
+            if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            output.returnCode = (locals.meta.status != QREWARDS_POOL_ACTIVE) ? QREWARDS_POOL_INACTIVE
+                              : ((qpi.invocator() != locals.meta.admin) ? QREWARDS_NOT_ADMIN : QREWARDS_WRONG_MODE);
+            return;
+        }
+        locals.budget = (uint64)qpi.invocationReward();
+        locals.charged = 0;
         locals.n = (input.count > QREWARDS_MAX_RECIP_BATCH) ? QREWARDS_MAX_RECIP_BATCH : input.count;
         for (locals.i = 0; locals.i < locals.n; locals.i++)
         {
             locals.w = input.wallets.get(locals.i);
             locals.wt = input.weights.get(locals.i);
-            // Clamp the weight: relative values only need to be modest, and this keeps the
-            // pot * weight product (computed in uint128 at distribution) far from overflow.
             if (locals.wt > QREWARDS_MAX_LIST_WEIGHT) locals.wt = QREWARDS_MAX_LIST_WEIGHT;
-            setMemory(locals.proto, 0);
-            locals.proto.poolId = input.poolId;
-            locals.proto.wallet = locals.w;
-            locals.key = qpi.K12(locals.proto);
-            locals.existed = state.get().recipients.contains(locals.key);
+            if (isReservedId(locals.w)) { output.rejected++; continue; }
+            locals.fei.poolId = input.poolId;
+            locals.fei.wallet = locals.w;
+            CALL(FindEntry, locals.fei, locals.feo);
             if (locals.wt == 0)
             {
-                if (locals.existed)
+                if (locals.feo.slot != QREWARDS_NONE)
                 {
-                    state.mut().recipients.removeByKey(locals.key); // weight 0 -> remove
-                    if (locals.meta.listCount > 0) locals.meta.listCount--;
+                    locals.rei.slot = locals.feo.slot;
+                    CALL(RemoveEntry, locals.rei, locals.reo);
                 }
                 continue;
             }
-            // Enforce the per-pool cap on NEW wallets only (updates to existing entries are fine).
-            if (!locals.existed && locals.meta.listCount >= QREWARDS_MAX_LIST_PER_POOL)
+            if (locals.feo.slot != QREWARDS_NONE)
+            {
+                locals.e = state.get().members.get(locals.feo.slot);
+                locals.e.listWeight = locals.wt;
+                state.mut().members.set(locals.feo.slot, locals.e);
+                output.added++;
+                continue;
+            }
+            if (state.get().poolMeta.get(input.poolId).memberCount >= QREWARDS_MAX_MEMBERS_PER_POOL
+                || locals.budget < state.get().joinFee || locals.feo.taken)
             {
                 output.rejected++;
                 continue;
             }
-            setMemory(locals.e, 0);
-            locals.e.wallet = locals.w;
-            locals.e.poolId = input.poolId;
-            locals.e.weight = locals.wt;
-            locals.e.version = locals.meta.listVersion;
-            if (state.mut().recipients.set(locals.key, locals.e) != NULL_INDEX)
-            {
-                if (!locals.existed) locals.meta.listCount++;
-                output.added++;
-            }
-            else
-            {
-                output.rejected++; // shared map globally full
-            }
+            locals.aei.poolId = input.poolId;
+            locals.aei.wallet = locals.w;
+            locals.aei.status = QREWARDS_ENTRY_LISTED;
+            locals.aei.listWeight = locals.wt;
+            locals.aei.key = locals.feo.key;
+            CALL(AddEntry, locals.aei, locals.aeo);
+            if (locals.aeo.slot == QREWARDS_NONE) { output.rejected++; continue; }
+            locals.budget -= state.get().joinFee;
+            locals.charged += state.get().joinFee;
+            output.added++;
         }
-        state.mut().poolMeta.set(input.poolId, locals.meta);
-        output.listCount = locals.meta.listCount;
+        if (locals.charged > 0) qpi.burn((sint64)locals.charged);
+        if (locals.budget > 0) qpi.transfer(qpi.invocator(), (sint64)locals.budget);
+        output.listCount = state.get().poolMeta.get(input.poolId).memberCount;
         output.returnCode = QREWARDS_SUCCESS;
     }
 
-    // Clear a pool's entire recipient list. Physically removes the pool's entries so their slots in
-    // the shared, finite `recipients` map are reclaimed (a bare version bump would leave them as live
-    // occupants forever -> a slow leak toward lockout). listVersion is still bumped so any entry not
-    // yet compacted is ignored immediately. The scan is O(map size) but admin-initiated and rare.
+    // Remove every recipient of a list-mode pool. Bounded by QREWARDS_MAX_MEMBERS_PER_POOL.
     struct clearRecipients_input { uint64 poolId; };
     struct clearRecipients_output { sint32 returnCode; uint32 removed; };
-    struct clearRecipients_locals { PoolMeta meta; sint64 idx; };
+    struct clearRecipients_locals { PoolMeta meta; RemoveEntry_input rei; RemoveEntry_output reo; };
     PUBLIC_PROCEDURE_WITH_LOCALS(clearRecipients)
     {
         if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
         output.removed = 0;
         if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
         locals.meta = state.get().poolMeta.get(input.poolId);
+        if (locals.meta.status != QREWARDS_POOL_ACTIVE) { output.returnCode = QREWARDS_POOL_INACTIVE; return; }
         if (qpi.invocator() != locals.meta.admin) { output.returnCode = QREWARDS_NOT_ADMIN; return; }
-        for (locals.idx = state.get().recipients.nextElementIndex(NULL_INDEX);
-             locals.idx != NULL_INDEX;
-             locals.idx = state.get().recipients.nextElementIndex(locals.idx))
+        if (locals.meta.targetMode != QREWARDS_TARGET_LIST) { output.returnCode = QREWARDS_WRONG_MODE; return; }
+        while (state.get().poolMeta.get(input.poolId).headSlot != QREWARDS_NONE)
         {
-            if (state.get().recipients.value(locals.idx).poolId == input.poolId)
-            {
-                state.mut().recipients.removeByIndex(locals.idx); // marks slot reusable; safe mid-iteration
-                output.removed++;
-            }
+            locals.rei.slot = state.get().poolMeta.get(input.poolId).headSlot;
+            CALL(RemoveEntry, locals.rei, locals.reo);
+            output.removed++;
         }
-        state.mut().recipients.cleanupIfNeeded();
-        locals.meta.listVersion++;
-        locals.meta.listCount = 0; // list emptied
-        state.mut().poolMeta.set(input.poolId, locals.meta);
         output.returnCode = QREWARDS_SUCCESS;
     }
 
-    // Deposit a dividend into one pool/currency. Added to the currency's pot and paid
-    // to live holders at END_EPOCH.
-    //  - QU currency (slot where assetName==0): QU is taken from the invocation reward.
-    //  - asset currency: `amount` of the asset is pulled from the caller into the contract.
+    // --- Holdings mode: join to earn ---
+
+    // Join a holdings-mode pool. Costs joinFee (burned into the fee reserve; any excess reward is
+    // refunded). The caller must currently hold something that counts (locked assets or NFTs,
+    // weight > 0), must not be excluded, and must not be a contract. When the pool is full, the
+    // caller names a current member with strictly lower weight to displace, so low-weight entries can never
+    // crowd out real holders. A closing pool still accepts joins while it has pots to pay out.
+    struct join_input { uint64 poolId; id displace; };
+    struct join_output { sint32 returnCode; };
+    struct join_locals
+    {
+        PoolMeta meta;
+        DivCurrency cur;
+        uint32 k;
+        bit anyFunds;
+        uint64 weight;
+        uint64 victimWeight;
+        FindEntry_input fei;
+        FindEntry_output feo;
+        FindEntry_input vfi;
+        FindEntry_output vfo;
+        ComputeAssetWeight_input cawi;
+        ComputeAssetWeight_output cawo;
+        ComputeNftWeight_input cnwi;
+        ComputeNftWeight_output cnwo;
+        AddEntry_input aei;
+        AddEntry_output aeo;
+        RemoveEntry_input rei;
+        RemoveEntry_output reo;
+        QRewardsLogger log;
+    };
+    PUBLIC_PROCEDURE_WITH_LOCALS(join)
+    {
+        if (isReservedId(qpi.invocator()))
+        {
+            if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            output.returnCode = QREWARDS_CONTRACT_NOT_ALLOWED;
+            return;
+        }
+        if (input.poolId >= state.get().numPools)
+        {
+            if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            output.returnCode = QREWARDS_POOL_NOT_FOUND;
+            return;
+        }
+        locals.meta = state.get().poolMeta.get(input.poolId);
+        locals.anyFunds = 0;
+        for (locals.k = 0; locals.k < locals.meta.numCurrencies; locals.k++)
+        {
+            locals.cur = locals.meta.currencies.get(locals.k);
+            if (locals.cur.pot > 0 || locals.cur.distributable > 0) locals.anyFunds = 1;
+        }
+        if (locals.meta.status == QREWARDS_POOL_FREE || (locals.meta.status == QREWARDS_POOL_CLOSING && !locals.anyFunds))
+        {
+            if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            output.returnCode = QREWARDS_POOL_INACTIVE;
+            return;
+        }
+        if (locals.meta.targetMode != QREWARDS_TARGET_HOLDINGS)
+        {
+            if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            output.returnCode = QREWARDS_WRONG_MODE;
+            return;
+        }
+        if ((uint64)qpi.invocationReward() < state.get().joinFee)
+        {
+            if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            output.returnCode = QREWARDS_INSUFFICIENT_FEE;
+            return;
+        }
+        locals.fei.poolId = input.poolId;
+        locals.fei.wallet = qpi.invocator();
+        CALL(FindEntry, locals.fei, locals.feo);
+        if (locals.feo.slot != QREWARDS_NONE || locals.feo.taken)
+        {
+            qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            output.returnCode = (locals.feo.status == QREWARDS_ENTRY_EXCLUDED) ? QREWARDS_EXCLUDED
+                              : (locals.feo.taken ? QREWARDS_REGISTRY_FULL : QREWARDS_ALREADY_MEMBER);
+            return;
+        }
+        locals.cawi.poolId = input.poolId;
+        locals.cawi.wallet = qpi.invocator();
+        CALL(ComputeAssetWeight, locals.cawi, locals.cawo);
+        locals.cnwi.poolId = input.poolId;
+        locals.cnwi.wallet = qpi.invocator();
+        CALL(ComputeNftWeight, locals.cnwi, locals.cnwo);
+        locals.weight = satAdd64(locals.cawo.weight, locals.cnwo.weight);
+        if (locals.weight == 0)
+        {
+            qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            output.returnCode = QREWARDS_NO_WEIGHT;
+            return;
+        }
+
+        if (locals.meta.memberCount >= QREWARDS_MAX_MEMBERS_PER_POOL)
+        {
+            locals.vfi.poolId = input.poolId;
+            locals.vfi.wallet = input.displace;
+            CALL(FindEntry, locals.vfi, locals.vfo);
+            locals.victimWeight = 0xFFFFFFFFFFFFFFFFULL;
+            if (locals.vfo.slot != QREWARDS_NONE && locals.vfo.status == QREWARDS_ENTRY_MEMBER)
+            {
+                locals.cawi.wallet = input.displace;
+                CALL(ComputeAssetWeight, locals.cawi, locals.cawo);
+                locals.cnwi.wallet = input.displace;
+                CALL(ComputeNftWeight, locals.cnwi, locals.cnwo);
+                locals.victimWeight = satAdd64(locals.cawo.weight, locals.cnwo.weight);
+            }
+            if (locals.victimWeight >= locals.weight)
+            {
+                qpi.transfer(qpi.invocator(), qpi.invocationReward());
+                output.returnCode = QREWARDS_POOL_FULL;
+                return;
+            }
+            locals.rei.slot = locals.vfo.slot;
+            CALL(RemoveEntry, locals.rei, locals.reo);
+        }
+
+        locals.aei.poolId = input.poolId;
+        locals.aei.wallet = qpi.invocator();
+        locals.aei.status = QREWARDS_ENTRY_MEMBER;
+        locals.aei.listWeight = 0;
+        locals.aei.key = locals.feo.key;
+        CALL(AddEntry, locals.aei, locals.aeo);
+        if (locals.aeo.slot == QREWARDS_NONE)
+        {
+            qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            output.returnCode = QREWARDS_REGISTRY_FULL;
+            return;
+        }
+        qpi.burn((sint64)state.get().joinFee);
+        if ((uint64)qpi.invocationReward() > state.get().joinFee)
+        {
+            qpi.transfer(qpi.invocator(), qpi.invocationReward() - (sint64)state.get().joinFee);
+        }
+        output.returnCode = QREWARDS_SUCCESS;
+        locals.log = QRewardsLogger{ CONTRACT_INDEX, QREWARDS_LOG_MEMBER_JOINED, 0 };
+        LOG_INFO(locals.log);
+    }
+
+    // Leave a holdings-mode pool (frees the slot; the join fee is not refunded).
+    struct leave_input { uint64 poolId; };
+    struct leave_output { sint32 returnCode; };
+    struct leave_locals { FindEntry_input fei; FindEntry_output feo; RemoveEntry_input rei; RemoveEntry_output reo; };
+    PUBLIC_PROCEDURE_WITH_LOCALS(leave)
+    {
+        if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+        if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
+        locals.fei.poolId = input.poolId;
+        locals.fei.wallet = qpi.invocator();
+        CALL(FindEntry, locals.fei, locals.feo);
+        if (locals.feo.slot == QREWARDS_NONE || locals.feo.status != QREWARDS_ENTRY_MEMBER)
+        {
+            output.returnCode = QREWARDS_NOT_MEMBER;
+            return;
+        }
+        locals.rei.slot = locals.feo.slot;
+        CALL(RemoveEntry, locals.rei, locals.reo);
+        output.returnCode = QREWARDS_SUCCESS;
+    }
+
+    // Deposit a dividend into one pool/currency. Added to the currency's pot and paid to the
+    // pool's members in the next distribution cycle.
+    //  - QU currency (assetName==0): QU is taken from the invocation reward.
+    //  - asset currency: `amount` of the asset is pulled from the caller into the contract (the
+    //    caller first transfers management rights of those shares to QREWARDS via QX).
     struct depositDividend_input { uint64 poolId; uint32 currencyIndex; uint64 amount; };
     struct depositDividend_output { sint32 returnCode; };
     struct depositDividend_locals
@@ -1249,10 +1756,10 @@ public:
             return;
         }
         locals.meta = state.get().poolMeta.get(input.poolId);
-        if (!locals.meta.active || locals.meta.paused || input.currencyIndex >= locals.meta.numCurrencies)
+        if (locals.meta.status != QREWARDS_POOL_ACTIVE || locals.meta.paused || input.currencyIndex >= locals.meta.numCurrencies)
         {
             if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
-            output.returnCode = (!locals.meta.active) ? QREWARDS_POOL_INACTIVE
+            output.returnCode = (locals.meta.status != QREWARDS_POOL_ACTIVE) ? QREWARDS_POOL_INACTIVE
                                : (locals.meta.paused ? QREWARDS_POOL_PAUSED : QREWARDS_INVALID_INDEX);
             return;
         }
@@ -1260,13 +1767,11 @@ public:
 
         if (locals.cur.assetName == 0 && locals.cur.issuer == NULL_ID)
         {
-            // QU currency: use the invocation reward.
             locals.rev = (uint64)qpi.invocationReward();
             locals.isQU = 1;
         }
         else
         {
-            // Asset currency: refund any QU, pull `amount` of the asset from the caller.
             if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
             if (input.amount == 0) { output.returnCode = QREWARDS_SUCCESS; return; }
             if (qpi.transferShareOwnershipAndPossession(locals.cur.assetName, locals.cur.issuer,
@@ -1284,8 +1789,7 @@ public:
         // 5% dividend fee, split 80% / 20% (20% -> QREWARDS shareholders for both).
         //  - QU  : whole fee accrues to pendingDivFeeQU; split 80/20 at END_EPOCH.
         //  - Token: distributed inline. 20% to shareholders in the token itself; the rest
-        //           (80% + dust + any failed shareholder sends) to the QPAY wallet. No QPAY
-        //           wallet set -> no fee taken on tokens.
+        //           (80% + dust + any shares not sent) to the QPAY wallet.
         locals.fee = div(locals.rev * QREWARDS_DIVIDEND_FEE_PCT, 100ULL);
         if (locals.fee > 0)
         {
@@ -1312,7 +1816,6 @@ public:
                     locals.rev -= locals.dtso.distributed;
                 }
             }
-            // else (token with no QPAY dividends address): no fee taken.
         }
 
         locals.cur.lifetime += locals.rev;
@@ -1326,7 +1829,7 @@ public:
     }
 
     // Top up a pool's operating balance (the per-epoch operating fee is drawn from it).
-    // Open to anyone; QU is taken from the invocation reward.
+    // Open to anyone; QU is taken from the invocation reward. A closing pool cannot be revived.
     struct depositOperating_input { uint64 poolId; };
     struct depositOperating_output { sint32 returnCode; uint64 operatingBalance; };
     struct depositOperating_locals { PoolMeta meta; };
@@ -1339,7 +1842,7 @@ public:
             return;
         }
         locals.meta = state.get().poolMeta.get(input.poolId);
-        if (!locals.meta.active) // a deactivated pool cannot be revived
+        if (locals.meta.status != QREWARDS_POOL_ACTIVE)
         {
             if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
             output.returnCode = QREWARDS_POOL_INACTIVE;
@@ -1354,51 +1857,43 @@ public:
         output.returnCode = QREWARDS_SUCCESS;
     }
 
-    struct setPlatformParams_input { uint64 createPoolFee; uint64 operatingFee; };
+    // Platform owner: tune the fees within their hardwired [min, max] ranges.
+    struct setPlatformParams_input { uint64 createPoolFee; uint64 operatingFee; uint64 joinFee; };
     struct setPlatformParams_output { sint32 returnCode; };
     PUBLIC_PROCEDURE(setPlatformParams)
     {
         if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
         if (qpi.invocator() != state.get().platformOwner) { output.returnCode = QREWARDS_NOT_PLATFORM_OWNER; return; }
-        if (input.createPoolFee > QREWARDS_MAX_CREATE_POOL_FEE || input.operatingFee > QREWARDS_MAX_OPERATING_FEE)
+        if (input.createPoolFee < QREWARDS_MIN_CREATE_POOL_FEE || input.createPoolFee > QREWARDS_MAX_CREATE_POOL_FEE
+            || input.operatingFee > QREWARDS_MAX_OPERATING_FEE
+            || input.joinFee < QREWARDS_MIN_JOIN_FEE || input.joinFee > QREWARDS_MAX_JOIN_FEE)
         {
             output.returnCode = QREWARDS_INVALID_PARAM;
             return;
         }
         state.mut().createPoolFee = input.createPoolFee;
         state.mut().operatingFee = input.operatingFee;
+        state.mut().joinFee = input.joinFee;
         output.returnCode = QREWARDS_SUCCESS;
     }
 
-    // The platform owner (and the fee destinations) are hardcoded in INITIALIZE with no setters,
-    // so they can never be repointed or transferred after deployment. A compromised owner key
-    // therefore cannot hand the role to anyone or redirect fees; rotating the owner requires a
-    // code change + redeploy, which is deliberate.
+    // The platform owner and the fee destinations are hardcoded in INITIALIZE with no setters,
+    // so they can never be repointed after deployment.
 
-    // Register (or clear) a funding route: a plain QU transfer from the caller is
-    // auto-credited to poolId's QU currency via POST_INCOMING_TRANSFER. Lets even
-    // lower-index contracts fund a pool with a plain qpi.transfer (no procedure call).
-    struct setFundingRoute_input { uint64 poolId; bit clear; };
-    struct setFundingRoute_output { sint32 returnCode; };
-    PUBLIC_PROCEDURE(setFundingRoute)
-    {
-        if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
-        if (input.clear)
-        {
-            state.mut().fundingRoute.removeByKey(qpi.invocator());
-            output.returnCode = QREWARDS_SUCCESS;
-            return;
-        }
-        if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
-        state.mut().fundingRoute.set(qpi.invocator(), input.poolId);
-        output.returnCode = QREWARDS_SUCCESS;
-    }
-
+    // Unlock: move QREWARDS-managed shares to another contract's management (e.g. back to QX to
+    // trade them). Refused while a distribution cycle runs, so locked shares cannot move between
+    // members during a cycle; any other time it is open.
     struct TransferShareManagementRights_input { Asset asset; sint64 numberOfShares; uint32 newManagingContractIndex; };
     struct TransferShareManagementRights_output { sint64 transferredNumberOfShares; };
     struct TransferShareManagementRights_locals { sint64 result; };
     PUBLIC_PROCEDURE_WITH_LOCALS(TransferShareManagementRights)
     {
+        if (state.get().cycleActive)
+        {
+            output.transferredNumberOfShares = 0;
+            if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            return;
+        }
         if (qpi.numberOfPossessedShares(input.asset.assetName, input.asset.issuer,
                 qpi.invocator(), qpi.invocator(), SELF_INDEX, SELF_INDEX) < input.numberOfShares)
         {
@@ -1420,36 +1915,45 @@ public:
         }
     }
 
-    // Protocol owner: switch distribution between END_EPOCH (0, default) and streamed (1).
-    // Takes effect from the next cycle; an in-progress streamed cycle finishes first. The
-    // streamed 24h delay and batch size are fixed (QREWARDS_STREAM_DELAY_TICKS / _BATCH).
-    struct setDistributionMode_input { uint8 mode; };
-    struct setDistributionMode_output { sint32 returnCode; };
-    PUBLIC_PROCEDURE(setDistributionMode)
-    {
-        if (qpi.invocationReward() > 0) qpi.transfer(qpi.invocator(), qpi.invocationReward());
-        if (qpi.invocator() != state.get().platformOwner) { output.returnCode = QREWARDS_NOT_PLATFORM_OWNER; return; }
-        state.mut().distributionMode = (input.mode == QREWARDS_DIST_STREAMED) ? QREWARDS_DIST_STREAMED : QREWARDS_DIST_END_EPOCH;
-        output.returnCode = QREWARDS_SUCCESS;
-    }
-
     /**************************************/
     /********FUNCTIONS (read-only)*********/
     /**************************************/
 
-    // Live weight of a user in a pool (what the END_EPOCH snapshot would record now).
-    // Divide by getPool().lastTotalWeight for an approximate share of the next payout.
+    // Current weight of a wallet in a pool -- exactly what the next MEASURE would record if the
+    // wallet is (or joins as) a member. List mode: the wallet's listed weight. Excluded: 0.
     struct previewWeight_input { uint64 poolId; id user; };
-    struct previewWeight_output { uint64 weight; sint32 returnCode; };
-    struct previewWeight_locals { ComputeEntitlement_input cei; ComputeEntitlement_output ceo; };
+    struct previewWeight_output { uint64 weight; sint32 returnCode; uint8 entryStatus; };
+    struct previewWeight_locals
+    {
+        PoolMeta meta;
+        FindEntry_input fei; FindEntry_output feo;
+        ComputeAssetWeight_input cawi; ComputeAssetWeight_output cawo;
+        ComputeNftWeight_input cnwi; ComputeNftWeight_output cnwo;
+    };
     PUBLIC_FUNCTION_WITH_LOCALS(previewWeight)
     {
+        output.weight = 0;
+        output.entryStatus = QREWARDS_ENTRY_FREE;
         if (input.poolId >= state.get().numPools) { output.returnCode = QREWARDS_POOL_NOT_FOUND; return; }
-        locals.cei.poolId = input.poolId;
-        locals.cei.user = input.user;
-        CALL(ComputeEntitlement, locals.cei, locals.ceo);
-        output.weight = locals.ceo.weight;
+        locals.meta = state.get().poolMeta.get(input.poolId);
+        locals.fei.poolId = input.poolId;
+        locals.fei.wallet = input.user;
+        CALL(FindEntry, locals.fei, locals.feo);
+        output.entryStatus = locals.feo.status;
         output.returnCode = QREWARDS_SUCCESS;
+        if (locals.meta.targetMode == QREWARDS_TARGET_LIST)
+        {
+            if (locals.feo.status == QREWARDS_ENTRY_LISTED) output.weight = state.get().members.get(locals.feo.slot).listWeight;
+            return;
+        }
+        if (locals.feo.status == QREWARDS_ENTRY_EXCLUDED || isReservedId(input.user)) return;
+        locals.cawi.poolId = input.poolId;
+        locals.cawi.wallet = input.user;
+        CALL(ComputeAssetWeight, locals.cawi, locals.cawo);
+        locals.cnwi.poolId = input.poolId;
+        locals.cnwi.wallet = input.user;
+        CALL(ComputeNftWeight, locals.cnwi, locals.cnwo);
+        output.weight = satAdd64(locals.cawo.weight, locals.cnwo.weight);
     }
 
     struct getPool_input { uint64 poolId; };
@@ -1460,12 +1964,19 @@ public:
         uint64 operatingBalance;
         uint64 lastTotalWeight;
         uint32 numAssets;
+        uint32 numNfts;
         uint32 missedEpochs;
+        uint32 memberCount;
+        uint32 excludedCount;
+        uint32 generation;
         uint8 numCurrencies;
-        uint8 active;
+        uint8 status;
         uint8 paused;
+        uint8 targetMode;
         Array<uint64, QREWARDS_MAX_DIV_CURRENCIES> currencyAssetName;
+        Array<id, QREWARDS_MAX_DIV_CURRENCIES> currencyIssuer;
         Array<uint64, QREWARDS_MAX_DIV_CURRENCIES> currencyPot;
+        Array<uint64, QREWARDS_MAX_DIV_CURRENCIES> currencyDistributable;
         Array<uint64, QREWARDS_MAX_DIV_CURRENCIES> currencyLifetime;
         sint32 returnCode;
     };
@@ -1480,15 +1991,22 @@ public:
         output.operatingBalance = locals.meta.operatingBalance;
         output.lastTotalWeight = locals.meta.lastTotalWeight;
         output.numAssets = locals.meta.numAssets;
+        output.numNfts = locals.meta.numNfts;
         output.missedEpochs = locals.meta.missedEpochs;
+        output.memberCount = locals.meta.memberCount;
+        output.excludedCount = locals.meta.excludedCount;
+        output.generation = locals.meta.generation;
         output.numCurrencies = locals.meta.numCurrencies;
-        output.active = locals.meta.active;
+        output.status = locals.meta.status;
         output.paused = locals.meta.paused;
+        output.targetMode = locals.meta.targetMode;
         for (locals.k = 0; locals.k < locals.meta.numCurrencies; locals.k++)
         {
             locals.cur = locals.meta.currencies.get(locals.k);
             output.currencyAssetName.set(locals.k, locals.cur.assetName); // 0 = QU
+            output.currencyIssuer.set(locals.k, locals.cur.issuer);
             output.currencyPot.set(locals.k, locals.cur.pot);
+            output.currencyDistributable.set(locals.k, locals.cur.distributable);
             output.currencyLifetime.set(locals.k, locals.cur.lifetime);
         }
         output.returnCode = QREWARDS_SUCCESS;
@@ -1520,7 +2038,7 @@ public:
         uint32 count;
         sint32 returnCode;
     };
-    struct getAllPoolAssets_locals { PoolMeta meta; uint32 i; uint64 base; AssetRule rule; };
+    struct getAllPoolAssets_locals { PoolMeta meta; uint32 i; uint64 base; };
     PUBLIC_FUNCTION_WITH_LOCALS(getAllPoolAssets)
     {
         setMemory(output, 0);
@@ -1529,8 +2047,7 @@ public:
         locals.base = input.poolId * (uint64)QREWARDS_MAX_ASSETS_PER_POOL;
         for (locals.i = 0; locals.i < locals.meta.numAssets; locals.i++)
         {
-            locals.rule = state.get().registry.get(locals.base + locals.i);
-            output.assets.set(locals.i, locals.rule);
+            output.assets.set(locals.i, state.get().registry.get(locals.base + locals.i));
         }
         output.count = locals.meta.numAssets;
         output.returnCode = QREWARDS_SUCCESS;
@@ -1551,8 +2068,7 @@ public:
         output.returnCode = QREWARDS_SUCCESS;
     }
 
-    // Return every registered NFT id in a pool in one call (so a depositor can audit the NFT-
-    // backed weight source the same way getAllPoolAssets lets them audit the asset registry).
+    // Return every registered NFT id in a pool in one call.
     struct getAllPoolNFTs_input { uint64 poolId; };
     struct getAllPoolNFTs_output
     {
@@ -1560,7 +2076,7 @@ public:
         uint32 count;
         sint32 returnCode;
     };
-    struct getAllPoolNFTs_locals { PoolMeta meta; uint32 i; uint64 base; NFTRule rule; };
+    struct getAllPoolNFTs_locals { PoolMeta meta; uint32 i; uint64 base; };
     PUBLIC_FUNCTION_WITH_LOCALS(getAllPoolNFTs)
     {
         setMemory(output, 0);
@@ -1569,15 +2085,31 @@ public:
         locals.base = input.poolId * (uint64)QREWARDS_MAX_NFT_PER_POOL;
         for (locals.i = 0; locals.i < locals.meta.numNfts; locals.i++)
         {
-            locals.rule = state.get().nftRegistry.get(locals.base + locals.i);
-            output.nfts.set(locals.i, locals.rule);
+            output.nfts.set(locals.i, state.get().nftRegistry.get(locals.base + locals.i));
         }
         output.count = locals.meta.numNfts;
         output.returnCode = QREWARDS_SUCCESS;
     }
 
     struct getPlatform_input { };
-    struct getPlatform_output { id platformOwner; id qpayhubAddress; id qpayTokenDividendsAddress; uint64 createPoolFee; uint64 operatingFee; uint32 numPools; uint8 distributionMode; uint32 streamDelayTicks; uint32 streamBatchSize; uint8 cycleActive; };
+    struct getPlatform_output
+    {
+        id platformOwner;
+        id qpayhubAddress;
+        id qpayTokenDividendsAddress;
+        uint64 createPoolFee;
+        uint64 operatingFee;
+        uint64 joinFee;
+        uint32 numPools;
+        uint32 numFreePools;
+        uint32 totalEntries;
+        uint32 streamDelayTicks;
+        uint32 streamBatchSize;
+        uint32 cycleId;
+        uint32 streamPoolCursor;
+        uint8 cycleActive;
+        uint8 streamPhase;
+    };
     PUBLIC_FUNCTION(getPlatform)
     {
         output.platformOwner = state.get().platformOwner;
@@ -1585,41 +2117,84 @@ public:
         output.qpayTokenDividendsAddress = state.get().qpayTokenDividendsAddress;
         output.createPoolFee = state.get().createPoolFee;
         output.operatingFee = state.get().operatingFee;
+        output.joinFee = state.get().joinFee;
         output.numPools = state.get().numPools;
-        output.distributionMode = state.get().distributionMode;
+        output.numFreePools = state.get().numFreePools;
+        output.totalEntries = state.get().totalEntries;
         output.streamDelayTicks = state.get().streamDelayTicks;
         output.streamBatchSize = state.get().streamBatchSize;
+        output.cycleId = state.get().cycleId;
+        output.streamPoolCursor = state.get().streamPoolCursor;
         output.cycleActive = state.get().cycleActive;
+        output.streamPhase = state.get().streamPhase;
     }
 
     struct isExcluded_input { uint64 poolId; id address; };
     struct isExcluded_output { bit excluded; };
-    struct isExcluded_locals { KeyProto proto; id key; uint8 flag; };
+    struct isExcluded_locals { FindEntry_input fei; FindEntry_output feo; };
     PUBLIC_FUNCTION_WITH_LOCALS(isExcluded)
     {
-        setMemory(locals.proto, 0);
-        locals.proto.poolId = input.poolId;
-        locals.proto.wallet = input.address;
-        locals.key = qpi.K12(locals.proto);
-        locals.flag = 0;
-        output.excluded = (state.get().excluded.get(locals.key, locals.flag) && locals.flag) ? 1 : 0;
+        locals.fei.poolId = input.poolId;
+        locals.fei.wallet = input.address;
+        CALL(FindEntry, locals.fei, locals.feo);
+        output.excluded = (locals.feo.status == QREWARDS_ENTRY_EXCLUDED) ? 1 : 0;
     }
 
-    struct getFundingRoute_input { id source; };
-    struct getFundingRoute_output { uint64 poolId; bit isSet; };
-    struct getFundingRoute_locals { uint64 p; };
-    PUBLIC_FUNCTION_WITH_LOCALS(getFundingRoute)
+    // Membership record of a wallet in a pool (status QREWARDS_ENTRY_FREE = not a member).
+    struct getMember_input { uint64 poolId; id wallet; };
+    struct getMember_output { uint8 status; uint64 listWeight; uint64 measuredWeight; uint32 measureCycle; };
+    struct getMember_locals { FindEntry_input fei; FindEntry_output feo; MemberEntry e; };
+    PUBLIC_FUNCTION_WITH_LOCALS(getMember)
     {
-        output.poolId = 0;
-        output.isSet = 0;
-        if (state.get().fundingRoute.get(input.source, locals.p))
+        setMemory(output, 0);
+        locals.fei.poolId = input.poolId;
+        locals.fei.wallet = input.wallet;
+        CALL(FindEntry, locals.fei, locals.feo);
+        if (locals.feo.slot == QREWARDS_NONE) return;
+        locals.e = state.get().members.get(locals.feo.slot);
+        output.status = locals.e.status;
+        output.listWeight = locals.e.listWeight;
+        output.measuredWeight = locals.e.measuredWeight;
+        output.measureCycle = locals.e.measureCycle;
+    }
+
+    // Page through a pool's entries (members, listed recipients and exclusions) in list order.
+    // `offset` skips that many entries; bounded by the per-pool caps.
+    struct getPoolMembers_input { uint64 poolId; uint32 offset; };
+    struct getPoolMembers_output
+    {
+        Array<id, QREWARDS_PAGE> wallets;
+        Array<uint8, QREWARDS_PAGE> statuses;
+        uint32 count;
+        uint32 total;
+    };
+    struct getPoolMembers_locals { PoolMeta meta; MemberEntry e; uint32 slot; uint32 skipped; };
+    PUBLIC_FUNCTION_WITH_LOCALS(getPoolMembers)
+    {
+        setMemory(output, 0);
+        if (input.poolId >= state.get().numPools) return;
+        locals.meta = state.get().poolMeta.get(input.poolId);
+        output.total = locals.meta.memberCount + locals.meta.excludedCount;
+        locals.skipped = 0;
+        locals.slot = locals.meta.headSlot;
+        while (locals.slot != QREWARDS_NONE && output.count < QREWARDS_PAGE)
         {
-            output.poolId = locals.p;
-            output.isSet = 1;
+            locals.e = state.get().members.get(locals.slot);
+            if (locals.skipped >= input.offset)
+            {
+                output.wallets.set(output.count, locals.e.wallet);
+                output.statuses.set(output.count, locals.e.status);
+                output.count++;
+            }
+            else
+            {
+                locals.skipped++;
+            }
+            locals.slot = locals.e.next;
         }
     }
 
-    // Paginated list of pools owned by an admin. `offset` skips that many matches;
+    // Paginated list of live pools owned by an admin. `offset` skips that many matches;
     // `count` is how many ids this page returned; `totalMatched` is the full total.
     struct getPoolsByAdmin_input { id admin; uint32 offset; };
     struct getPoolsByAdmin_output
@@ -1636,7 +2211,7 @@ public:
         for (locals.i = 0; locals.i < state.get().numPools; locals.i++)
         {
             locals.meta = state.get().poolMeta.get(locals.i);
-            if (locals.meta.admin == input.admin)
+            if (locals.meta.status != QREWARDS_POOL_FREE && locals.meta.admin == input.admin)
             {
                 if (locals.matched >= input.offset && output.count < QREWARDS_PAGE)
                 {
@@ -1652,18 +2227,21 @@ public:
     /**************************************/
     /************REGISTRATION**************/
     /**************************************/
+    // Retired ids (do not reuse): function 5 (getFundingRoute), procedures 12 (setFundingRoute)
+    // and 14 (setDistributionMode).
     REGISTER_USER_FUNCTIONS_AND_PROCEDURES()
     {
         REGISTER_USER_FUNCTION(getPool, 1);
         REGISTER_USER_FUNCTION(getPoolAsset, 2);
         REGISTER_USER_FUNCTION(getAllPoolAssets, 3);
         REGISTER_USER_FUNCTION(getPlatform, 4);
-        REGISTER_USER_FUNCTION(getFundingRoute, 5);
         REGISTER_USER_FUNCTION(getPoolsByAdmin, 6);
         REGISTER_USER_FUNCTION(isExcluded, 7);
         REGISTER_USER_FUNCTION(previewWeight, 8);
         REGISTER_USER_FUNCTION(getPoolNFT, 9);
         REGISTER_USER_FUNCTION(getAllPoolNFTs, 10);
+        REGISTER_USER_FUNCTION(getMember, 11);
+        REGISTER_USER_FUNCTION(getPoolMembers, 12);
 
         REGISTER_USER_PROCEDURE(createPool, 1);
         REGISTER_USER_PROCEDURE(registerAsset, 2);
@@ -1676,62 +2254,52 @@ public:
         REGISTER_USER_PROCEDURE(TransferShareManagementRights, 9);
         REGISTER_USER_PROCEDURE(registerAssets, 10);
         REGISTER_USER_PROCEDURE(addDividendCurrency, 11);
-        REGISTER_USER_PROCEDURE(setFundingRoute, 12);
         REGISTER_USER_PROCEDURE(setExcludedAddress, 13);
-        REGISTER_USER_PROCEDURE(setDistributionMode, 14);
         REGISTER_USER_PROCEDURE(setTargetMode, 15);
         REGISTER_USER_PROCEDURE(addRecipients, 16);
         REGISTER_USER_PROCEDURE(clearRecipients, 17);
         REGISTER_USER_PROCEDURE(registerNFT, 18);
         REGISTER_USER_PROCEDURE(updateNFT, 19);
+        REGISTER_USER_PROCEDURE(join, 20);
+        REGISTER_USER_PROCEDURE(leave, 21);
+        REGISTER_USER_PROCEDURE(removeAsset, 22);
+        REGISTER_USER_PROCEDURE(removeNFT, 23);
     }
 
     INITIALIZE()
     {
         // Platform owner is HARDCODED (not a first-caller bootstrap) so nobody can claim the role
-        // at deploy time and redirect fees. Owner = the QPay wallet
-        // (QPAYNOWSWZMGHFEAEVJXGZAVSHABAZDDBDIHTEBOPCOGHRGBCYCUZOHCVLXG). It can call only
-        // setPlatformParams (fees) and setDistributionMode (END_EPOCH<->streamed). There is no
-        // ownership-transfer function: the owner is fixed for the life of the deployment.
+        // at deploy time. Owner = the QPay wallet
+        // (QPAYNOWSWZMGHFEAEVJXGZAVSHABAZDDBDIHTEBOPCOGHRGBCYCUZOHCVLXG). It can only tune the
+        // fees within their hardwired ranges, and there is no ownership-transfer function.
         state.mut().platformOwner = ID(_Q, _P, _A, _Y, _N, _O, _W, _S, _W, _Z, _M, _G, _H, _F, _E, _A, _E, _V, _J, _X, _G, _Z, _A, _V, _S, _H, _A, _B, _A, _Z, _D, _D, _B, _D, _I, _H, _T, _E, _B, _O, _P, _C, _O, _G, _H, _R, _G, _B, _C, _Y, _C, _U, _Z, _O, _H, _C);
-        // QPAYHUB contract address = id(29, 0, 0, 0) (receives the 15% create/operating-fee
-        // share and the 80% QU dividend-fee leg; its POST_INCOMING_TRANSFER auto-credits plain
-        // QU to its feePool). QPAYHUB is CONTRACT_INDEX 29 on the live chain.
+        // QPAYHUB contract address = id(29, 0, 0, 0) (CONTRACT_INDEX 29 on the live chain).
         state.mut().qpayhubAddress = id(29, 0, 0, 0);
-        // Destination for the 80% leg of the 5% TOKEN dividend fee: the QRaffle charity
-        // address (DPQRLSZSSCXIYFIQGBFBXXISDDEBEGQNWNTQUEIFSCUWGHVXJPLFGMYD...), a plain
-        // wallet that simply receives the tokens. Hardcoded, no setter (immutable).
-        // (The 20% shareholder leg is unchanged.)
+        // Destination for the 80% leg of the 5% TOKEN dividend fee: the QRaffle charity address
+        // (DPQRLSZSSCXIYFIQGBFBXXISDDEBEGQNWNTQUEIFSCUWGHVXJPLFGMYD...), a plain wallet.
         state.mut().qpayTokenDividendsAddress = ID(_D, _P, _Q, _R, _L, _S, _Z, _S, _S, _C, _X, _I, _Y, _F, _I, _Q, _G, _B, _F, _B, _X, _X, _I, _S, _D, _D, _E, _B, _E, _G, _Q, _N, _W, _N, _T, _Q, _U, _E, _I, _F, _S, _C, _U, _W, _G, _H, _V, _X, _J, _P, _L, _F, _G, _M, _Y, _D);
         state.mut().createPoolFee = QREWARDS_DEFAULT_CREATE_FEE;
         state.mut().operatingFee = QREWARDS_DEFAULT_OPERATING_FEE;
-        state.mut().pendingDivFeeQU = 0;
-        state.mut().numPools = 0;
+        state.mut().joinFee = QREWARDS_DEFAULT_JOIN_FEE;
+        state.mut().memberFreeHead = QREWARDS_NONE;
+        state.mut().memberHighWater = 0;
 
-        // Streamed distribution: dormant by default (END_EPOCH mode). Protocol owner flips it on.
-        state.mut().distributionMode = QREWARDS_DIST_END_EPOCH;
         state.mut().streamDelayTicks = QREWARDS_STREAM_DELAY_TICKS;
         state.mut().streamBatchSize = QREWARDS_STREAM_BATCH;
-        state.mut().epochStartTick = 0;
         state.mut().lastCycleEpoch = QREWARDS_NO_CYCLE_EPOCH;
-        state.mut().cycleActive = 0;
-        state.mut().streamState = QREWARDS_STREAM_IDLE;
-        state.mut().streamCurrencyStarted = 0;
-        state.mut().streamPoolCursor = 0;
-        state.mut().streamCurrencyCursor = 0;
-        state.mut().streamPayCursor = NULL_INDEX;
-        state.mut().streamTotalWeightHi = 0;
-        state.mut().streamTotalWeightLo = 0;
-        state.mut().streamFrozenAmt = 0;
-        state.mut().streamPaidSum = 0;
+        state.mut().streamPhase = QREWARDS_PHASE_IDLE;
+        state.mut().streamMemberCursor = QREWARDS_NONE;
     }
 
     BEGIN_EPOCH()
     {
-        // Anchor the epoch so streamed mode can wait streamDelayTicks before starting a cycle.
+        // Anchor the epoch so a cycle starts streamDelayTicks into it.
         state.mut().epochStartTick = qpi.tick();
     }
 
+    // O(numPools): collect the per-epoch operating fee (pools that cannot pay are paused, and
+    // closed after QREWARDS_MAX_MISSED_EPOCHS), then flush the QU dividend fee. No distribution
+    // happens here -- a closing pool pays its remaining pots to its members through the engine.
     struct END_EPOCH_locals
     {
         uint32 i;
@@ -1742,22 +2310,15 @@ public:
         DistributeFee_output dfo;
         DistributeDivFee_input ddfi;
         DistributeDivFee_output ddfo;
-        DistributePool_input dpi;
-        DistributePool_output dpo;
-        uint32 k;
-        DivCurrency cur;
-        uint64 refundAmt;
     };
     END_EPOCH_WITH_LOCALS()
     {
-        // 1) Draw the per-epoch operating fee from each active pool; underfunded pools
-        //    are paused, and deactivated after being paused more than QREWARDS_MAX_MISSED_EPOCHS.
         locals.fee = state.get().operatingFee;
         locals.collected = 0;
         for (locals.i = 0; locals.i < state.get().numPools; locals.i++)
         {
             locals.meta = state.get().poolMeta.get(locals.i);
-            if (!locals.meta.active) continue;
+            if (locals.meta.status != QREWARDS_POOL_ACTIVE) continue;
             if (locals.fee == 0 || locals.meta.operatingBalance >= locals.fee)
             {
                 locals.meta.operatingBalance -= locals.fee;
@@ -1771,31 +2332,8 @@ public:
                 locals.meta.missedEpochs++;
                 if (locals.meta.missedEpochs > QREWARDS_MAX_MISSED_EPOCHS)
                 {
-                    locals.meta.active = 0; // paused > MAX epochs -> deactivate
-                    // Refund the deactivated pool's remaining funds to its admin so nothing is
-                    // stranded: each currency's (pot + distributable), plus the leftover
-                    // operating balance. Tokens are managed by SELF, so they transfer out.
-                    for (locals.k = 0; locals.k < locals.meta.numCurrencies; locals.k++)
-                    {
-                        locals.cur = locals.meta.currencies.get(locals.k);
-                        locals.refundAmt = locals.cur.pot + locals.cur.distributable;
-                        if (locals.refundAmt > 0)
-                        {
-                            if (locals.cur.assetName == 0 && locals.cur.issuer == NULL_ID)
-                                qpi.transfer(locals.meta.admin, (sint64)locals.refundAmt);
-                            else
-                                qpi.transferShareOwnershipAndPossession(locals.cur.assetName, locals.cur.issuer,
-                                    SELF, SELF, (sint64)locals.refundAmt, locals.meta.admin);
-                            locals.cur.pot = 0;
-                            locals.cur.distributable = 0;
-                            locals.meta.currencies.set(locals.k, locals.cur);
-                        }
-                    }
-                    if (locals.meta.operatingBalance > 0)
-                    {
-                        qpi.transfer(locals.meta.admin, (sint64)locals.meta.operatingBalance);
-                        locals.meta.operatingBalance = 0;
-                    }
+                    locals.meta.status = QREWARDS_POOL_CLOSING;
+                    locals.meta.paused = 0;
                 }
             }
             state.mut().poolMeta.set(locals.i, locals.meta);
@@ -1806,94 +2344,44 @@ public:
             CALL(DistributeFee, locals.dfi, locals.dfo);
         }
 
-        // 2) Flush the accrued 5% QU dividend fee: 80% QPAYHUB / 20% QREWARDS shareholders.
         if (state.get().pendingDivFeeQU > 0)
         {
             locals.ddfi.amount = state.get().pendingDivFeeQU;
-            CALL(DistributeDivFee, locals.ddfi, locals.ddfo);
             state.mut().pendingDivFeeQU = 0;
+            CALL(DistributeDivFee, locals.ddfi, locals.ddfo);
         }
 
-        // 3) Distribute pots. In END_EPOCH mode, pay every active pool now (one tick). In
-        //    streamed mode, END_TICK does it across the epoch, so skip here.
-        if (state.get().distributionMode == QREWARDS_DIST_END_EPOCH)
-        {
-            for (locals.i = 0; locals.i < state.get().numPools; locals.i++)
-            {
-                locals.dpi.poolId = locals.i;
-                CALL(DistributePool, locals.dpi, locals.dpo);
-            }
-            state.mut().snapshot.reset();
-        }
-
-        state.mut().fundingRoute.cleanupIfNeeded();
-        state.mut().excluded.cleanupIfNeeded();
-        state.mut().recipients.cleanupIfNeeded();
+        state.mut().memberIndex.cleanupIfNeeded();
     }
 
-    // Streamed-mode driver. Once per epoch, after streamDelayTicks have elapsed, start a
-    // distribution cycle; thereafter advance it a batch per tick until every pool is paid.
-    // Dormant (does nothing) in the default END_EPOCH mode.
-    struct END_TICK_locals { StreamDistribute_input sdi; StreamDistribute_output sdo; };
+    // Distribution driver: once per epoch, streamDelayTicks into it, start a cycle; then advance
+    // it by at most streamBatchSize O(1) units per tick until every pool has been processed.
+    struct END_TICK_locals { uint32 budget; StreamStep_input ssi; StreamStep_output sso; };
     END_TICK_WITH_LOCALS()
     {
-        if (state.get().distributionMode != QREWARDS_DIST_STREAMED) return;
         if (!state.get().cycleActive)
         {
-            // Start at most one cycle per epoch, once we're far enough into it.
-            if (state.get().lastCycleEpoch != qpi.epoch()
-                && (qpi.tick() - state.get().epochStartTick) >= state.get().streamDelayTicks)
+            if (state.get().lastCycleEpoch == qpi.epoch()
+                || qpi.tick() - state.get().epochStartTick < state.get().streamDelayTicks)
             {
-                state.mut().cycleActive = 1;
-                state.mut().streamPoolCursor = 0;
-                state.mut().streamState = QREWARDS_STREAM_IDLE;
-                state.mut().lastCycleEpoch = qpi.epoch();
+                return;
             }
+            state.mut().cycleActive = 1;
+            state.mut().cycleId = state.get().cycleId + 1;
+            state.mut().streamPoolCursor = 0;
+            state.mut().streamPhase = QREWARDS_PHASE_IDLE;
+            state.mut().lastCycleEpoch = qpi.epoch();
         }
-        if (state.get().cycleActive)
+        for (locals.budget = state.get().streamBatchSize; locals.budget > 0 && state.get().cycleActive; locals.budget--)
         {
-            CALL(StreamDistribute, locals.sdi, locals.sdo);
+            CALL(StreamStep, locals.ssi, locals.sso);
         }
     }
 
-    // Credit plain incoming QU to a routed pool's QU pot (slot 0).
-    // Only standard wallet transfers and contract qpi.transfers are routed;
-    // procedure/other-contract-invocation transfers are handled by depositDividend,
-    // so they are skipped here to avoid double counting.
-    struct POST_INCOMING_TRANSFER_locals
-    {
-        uint64 poolId;
-        PoolMeta meta;
-        DivCurrency cur;
-        uint64 rev;
-        uint64 fee;
-    };
-    POST_INCOMING_TRANSFER_WITH_LOCALS()
-    {
-        if (input.type != TransferType::standardTransaction && input.type != TransferType::qpiTransfer) return;
-        if (input.amount <= 0) return;
-        if (!state.get().fundingRoute.get(input.sourceId, locals.poolId)) return;
-        if (locals.poolId >= state.get().numPools) return;
-        locals.meta = state.get().poolMeta.get(locals.poolId);
-        if (!locals.meta.active || locals.meta.paused || locals.meta.numCurrencies == 0) return;
-
-        locals.cur = locals.meta.currencies.get(0); // slot 0 is always QU
-        locals.rev = (uint64)input.amount;
-        // 5% dividend fee -> pendingDivFeeQU (flushed 80/20 at END_EPOCH); 95% to the pot.
-        locals.fee = div(locals.rev * QREWARDS_DIVIDEND_FEE_PCT, 100ULL);
-        if (locals.fee > 0)
-        {
-            state.mut().pendingDivFeeQU += locals.fee;
-            locals.rev -= locals.fee;
-        }
-        locals.cur.lifetime += locals.rev;
-        locals.cur.pot += locals.rev;
-        locals.meta.currencies.set(0, locals.cur);
-        state.mut().poolMeta.set(locals.poolId, locals.meta);
-    }
-
+    // Only QX may hand share management rights to QREWARDS (the token-deposit flow). Shares
+    // pushed from any other contract would be stranded under QREWARDS management.
     PRE_ACQUIRE_SHARES()
     {
-        output.allowTransfer = true;
+        output.allowTransfer = (input.otherContractIndex == QREWARDS_QX_CONTRACT_INDEX);
     }
 };
